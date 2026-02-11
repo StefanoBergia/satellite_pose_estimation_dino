@@ -1,0 +1,9 @@
+torch>=2.1
+torchvision>=0.16
+transformers>=4.56
+opencv-python>=4.8
+Pillow
+pyyaml
+tensorboard
+tqdm
+matplotlib>=3.7

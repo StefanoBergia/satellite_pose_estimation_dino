@@ -1,0 +1,94 @@
+data:
+  root: /nfs/home/caracciolo/dataset/speedplus_yolo
+  num_keypoints: 11
+  image_size: 224
+  bbox_pad_ratio: 0.1
+  splits:
+    train:
+      images: images/train
+      labels: labels/train
+    val:
+      images: images/val
+      labels: labels/val
+    lightbox:
+      images: images/lightbox
+      labels: labels/lightbox
+    sunlamp:
+      images: images/sunlamp
+      labels: labels/sunlamp
+  # Pose label JSON files (needed for keypoint_pose and keypoint_pose_pnp modes)
+  pose_labels:
+    train: /nfs/home/caracciolo/dataset/speedplusv2/synthetic/train.json
+    val: /nfs/home/caracciolo/dataset/speedplusv2/synthetic/validation.json
+    lightbox: /nfs/home/caracciolo/dataset/speedplusv2/lightbox/test.json
+    sunlamp: /nfs/home/caracciolo/dataset/speedplusv2/sunlamp/test.json
+
+model:
+  backbone: facebook/dinov3-vitl16-pretrain-lvd1689m
+  freeze_backbone: true
+  # Number of final ViT blocks to unfreeze (0 = fully frozen, 4-6 recommended)
+  unfreeze_last_n_blocks: 4
+  head_hidden: [512, 256]
+  dropout: 0.1
+  # Mode: "keypoint_only" | "keypoint_pose" | "keypoint_pose_pnp"
+  mode: "keypoint_only"
+  # Keypoint head type: "mlp" (direct regression from CLS token) | "heatmap" (deconv + soft-argmax)
+  keypoint_head_type: "heatmap"
+
+# 3D model and camera (needed for keypoint_pose_pnp mode)
+geometry:
+  points_3d: tango3Dpoints.json
+  camera: camera.json
+  pnp_iterations: 10
+
+train:
+  epochs: 100
+  batch_size: 64
+  lr: 1.0e-3
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  occluded_weight: 0.5
+  num_workers: 2
+  output_dir: ./outputs_keypoints_heatmap
+  log_interval: 50
+
+augmentation:
+  # Photometric only — no spatial augmentations (flip/rotation/scale removed
+  # because they require careful keypoint remapping and the Tango has
+  # asymmetric keypoints)
+  color_jitter: 0.5
+  gaussian_blur_prob: 0.3
+  gaussian_blur_kernel: [3, 7]
+  gaussian_noise_prob: 0.3
+  gaussian_noise_std: 0.02
+  random_erasing_prob: 0.2
+  # Space lighting augmentations (sim-to-real domain gap)
+  sun_flare_prob: 0.3
+  sun_flare_intensity: [0.3, 1.0]
+  brightness_gradient_prob: 0.3
+  brightness_gradient_strength: [0.2, 0.6]
+  random_gamma_prob: 0.3
+  random_gamma_range: [0.5, 2.0]
+  # Sim-to-real domain gap augmentations
+  motion_blur_prob: 0.2
+  motion_blur_kernel: [5, 15]
+  clahe_prob: 0.3
+  clahe_clip_limit: [1.0, 4.0]
+  channel_dropout_prob: 0.2
+
+# Loss weights for pose modes
+pose:
+  lambda_keypoint: 1.0
+  lambda_heatmap: 4.0
+  heatmap_size: 64
+  heatmap_sigma: 1.5
+  lambda_direct_pose: 1.0
+  lambda_pnp_pose: 0.5
+  rotation_weight: 1.0
+  translation_weight: 1.0
+  # PnP warmup: skip PnP loss for first N epochs, then ramp up over M epochs
+  pnp_warmup_epochs: 10
+  pnp_rampup_epochs: 10
+
+eval:
+  pck_threshold: 0.05
