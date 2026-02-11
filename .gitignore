@@ -3,3 +3,5 @@ outputs/
 outputs_head_pose_pnp/
 outputs_keypoints/
 outputs_keypoints_heatmap
+*.png
+slurm/
