@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -6,6 +7,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from src.dataset import SpeedPlusKeypointDataset
+from src.fda import FDAStylePool
 from src.transforms import KeypointTransform
 from src.model import SatellitePoseModel
 from src.trainer import Trainer
@@ -49,6 +51,52 @@ def build_dataset(
         if split in pose_labels:
             pose_json = pose_labels[split]
 
+    # FDA augmentation (training split only)
+    fda_pool = None
+    fda_prob = 0.0
+    bg_labels = {}
+    if is_train and split == "train":
+        fda_prob = aug_cfg.get("fda_prob", 0.0)
+        if fda_prob > 0:
+            fda_cfg = config.get("fda", {})
+            splits_dir = Path(fda_cfg.get("splits_dir", "data/splits"))
+
+            # Load background labels for training images
+            train_bg_path = splits_dir / "train_bg_labels.json"
+            with open(train_bg_path) as f:
+                bg_labels = json.load(f)
+
+            # Build style pool from target domains
+            target_domains = aug_cfg.get("fda_target_domains", ["lightbox", "sunlamp"])
+            fda_image_dirs = {}
+            fda_style_lists = {}
+            fda_bg_labels = {}
+            for domain in target_domains:
+                domain_split_cfg = config["data"]["splits"][domain]
+                fda_image_dirs[domain] = str(root / domain_split_cfg["images"])
+                fda_style_lists[domain] = str(splits_dir / f"{domain}_style.txt")
+                domain_bg_path = splits_dir / f"{domain}_bg_labels.json"
+                with open(domain_bg_path) as f:
+                    fda_bg_labels[domain] = json.load(f)
+
+            fda_pool = FDAStylePool(
+                image_dirs=fda_image_dirs,
+                style_lists=fda_style_lists,
+                bg_labels=fda_bg_labels,
+                beta=aug_cfg.get("fda_beta", 0.05),
+                lambd=aug_cfg.get("fda_lambda", 0.5),
+            )
+
+    # Test-split filtering for eval splits (when FDA splits exist)
+    include_list = None
+    if not is_train and split in ("lightbox", "sunlamp"):
+        fda_cfg = config.get("fda", {})
+        splits_dir = Path(fda_cfg.get("splits_dir", "data/splits"))
+        test_list_path = splits_dir / f"{split}_test.txt"
+        if test_list_path.exists():
+            with open(test_list_path) as f:
+                include_list = set(line.strip() for line in f if line.strip())
+
     return SpeedPlusKeypointDataset(
         image_dir=str(image_dir),
         label_dir=str(label_dir),
@@ -56,6 +104,10 @@ def build_dataset(
         bbox_pad_ratio=config["data"].get("bbox_pad_ratio", 0.1),
         transform=transform,
         pose_json=pose_json,
+        include_list=include_list,
+        fda_pool=fda_pool,
+        fda_prob=fda_prob,
+        bg_labels=bg_labels,
     )
 
 

@@ -1,11 +1,0 @@
-Using device: cuda
-Mode: keypoint_only
-Building datasets...
-  train: 47966 samples
-  val: 11994 samples
-  lightbox: 6740 samples
-  sunlamp: 2791 samples
-Loading model...
-  Total params: 308,376,843
-  Trainable params: 55,638,283
-Epoch 1/100:   0%|          | 0/749 [00:00<?, ?it/s]Epoch 1/100:   0%|          | 0/749 [00:07<?, ?it/s]

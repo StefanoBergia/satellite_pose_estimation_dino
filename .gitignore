@@ -5,3 +5,5 @@ outputs_keypoints/
 outputs_keypoints_heatmap
 *.png
 slurm/
+src/__pycache__/fda.cpython-311.pyc
+outputs_keypoints_heatmap_FDA/

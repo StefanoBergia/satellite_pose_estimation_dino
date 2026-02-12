@@ -8,7 +8,7 @@
 #SBATCH --nodelist=thor
 #SBATCH  --partition=A100
 #SBATCH --gres=gpu:3g.40gb:1
-#SBATCH --job-name=Dino_v3_satellite_keypoints_heatmap
+#SBATCH --job-name=Dino_v3_satellite_keypoints_heatmap_FDA
 #SBATCH --mem=50GB
 #SBATCH --output=slurm/logs/%j.out
 #SBATCH --error=slurm/logs/%j.err

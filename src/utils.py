@@ -38,7 +38,9 @@ def solve_pnp_batch(
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
     confidence: np.ndarray | None = None,
-    confidence_threshold: float = 0.05,
+    confidence_threshold: float = 0.0,
+    reproj_error: float = 8.0,
+    min_inliers: int = 4,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Run OpenCV solvePnP on a batch of predicted keypoints.
 
@@ -53,7 +55,9 @@ def solve_pnp_batch(
         camera_matrix: (3, 3) camera intrinsic matrix
         dist_coeffs: (5,) distortion coefficients
         confidence: (B, K) optional per-keypoint confidence (e.g. heatmap peak)
-        confidence_threshold: minimum confidence to include a keypoint
+        confidence_threshold: minimum confidence to include a keypoint (default 0.0 = disabled)
+        reproj_error: RANSAC reprojection error threshold in pixels
+        min_inliers: minimum number of RANSAC inliers to accept a solution
 
     Returns:
         rotations: (B, 3, 3) rotation matrices (identity if PnP fails)
@@ -96,11 +100,11 @@ def solve_pnp_batch(
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(
             pts_3d, pts_2d, camera_matrix, dist_coeffs,
             flags=cv2.SOLVEPNP_EPNP,
-            reprojectionError=8.0,
+            reprojectionError=reproj_error,
             iterationsCount=100,
         )
 
-        if ok and inliers is not None and len(inliers) >= 4:
+        if ok and inliers is not None and len(inliers) >= min_inliers:
             R, _ = cv2.Rodrigues(rvec)
             rotations[i] = R
             translations[i] = tvec.flatten()
@@ -123,7 +127,9 @@ def compute_cv_pnp_slab(
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
     confidence: np.ndarray | None = None,
-    confidence_threshold: float = 0.05,
+    confidence_threshold: float = 0.0,
+    reproj_error: float = 8.0,
+    min_inliers: int = 4,
 ) -> dict[str, float]:
     """Compute SLAB score using OpenCV PnP on predicted keypoints.
 
@@ -140,7 +146,9 @@ def compute_cv_pnp_slab(
         camera_matrix: (3, 3) camera intrinsic matrix
         dist_coeffs: (5,) distortion coefficients
         confidence: (B, K) optional per-keypoint confidence (e.g. heatmap peak)
-        confidence_threshold: minimum confidence to include a keypoint
+        confidence_threshold: minimum confidence to include a keypoint (default 0.0 = disabled)
+        reproj_error: RANSAC reprojection error threshold in pixels
+        min_inliers: minimum number of RANSAC inliers to accept a solution
 
     Returns:
         dict with epnp_slab_sum, epnp_orient_sum, epnp_pos_sum,
@@ -159,6 +167,7 @@ def compute_cv_pnp_slab(
     rotations, translations, pnp_success, _ = solve_pnp_batch(
         pred_kp, crop_box, visibility, points_3d, camera_matrix, dist_coeffs,
         confidence=confidence, confidence_threshold=confidence_threshold,
+        reproj_error=reproj_error, min_inliers=min_inliers,
     )
 
     # Only evaluate where both has_pose and PnP succeeded

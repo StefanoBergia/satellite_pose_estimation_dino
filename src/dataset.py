@@ -1,4 +1,5 @@
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -26,12 +27,21 @@ class SpeedPlusKeypointDataset(Dataset):
         bbox_pad_ratio: float = 0.1,
         transform=None,
         pose_json: str | None = None,
+        include_list: set[str] | None = None,
+        fda_pool=None,
+        fda_prob: float = 0.0,
+        bg_labels: dict[str, str] | None = None,
     ):
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
         self.num_keypoints = num_keypoints
         self.bbox_pad_ratio = bbox_pad_ratio
         self.transform = transform
+
+        # FDA augmentation (optional)
+        self.fda_pool = fda_pool
+        self.fda_prob = fda_prob
+        self.bg_labels = bg_labels or {}
 
         # Load pose labels if provided
         self.pose_data = {}
@@ -48,6 +58,8 @@ class SpeedPlusKeypointDataset(Dataset):
         self.samples = []
         for img_path in sorted(self.image_dir.iterdir()):
             if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            if include_list is not None and img_path.name not in include_list:
                 continue
             label_path = self.label_dir / (img_path.stem + ".txt")
             if label_path.exists():
@@ -164,6 +176,11 @@ class SpeedPlusKeypointDataset(Dataset):
 
         # Remap keypoints to crop-relative coordinates
         kp_crop = self._remap_keypoints(keypoints, crop_box, img_w, img_h)
+
+        # FDA style transfer (before other augmentations)
+        if self.fda_pool is not None and random.random() < self.fda_prob:
+            bg_type = self.bg_labels.get(img_path.name, "black")
+            crop = self.fda_pool.apply(crop, bg_type)
 
         # Apply transforms (resize, normalize, augmentation)
         if self.transform is not None:

@@ -90,7 +90,9 @@ def _compute_single_pnp_errors(R, t, gt_q, gt_t):
 @torch.no_grad()
 def evaluate_split(model, loader, mode, device, pnp_data,
                    occluded_weight=0.5, pck_threshold=0.05,
-                   collect_stats=False):
+                   collect_stats=False,
+                   confidence_threshold=0.0, reproj_error=8.0,
+                   min_inliers=4):
     """Run evaluation on a single split. Returns dict of averaged metrics.
 
     When collect_stats=True, also returns a dict of per-sample arrays for
@@ -191,6 +193,9 @@ def evaluate_split(model, loader, mode, device, pnp_data,
                 gt_q, gt_t, has_pose,
                 pnp_data["points_3d"], pnp_data["camera_matrix"], pnp_data["dist_coeffs"],
                 confidence=confidence,
+                confidence_threshold=confidence_threshold,
+                reproj_error=reproj_error,
+                min_inliers=min_inliers,
             )
             for k, v in cv_pnp.items():
                 epnp_accum[k] = epnp_accum.get(k, 0.0) + v
@@ -233,6 +238,9 @@ def evaluate_split(model, loader, mode, device, pnp_data,
                     pnp_data["points_3d"], pnp_data["camera_matrix"],
                     pnp_data["dist_coeffs"],
                     confidence=confidence,
+                    confidence_threshold=confidence_threshold,
+                    reproj_error=reproj_error,
+                    min_inliers=min_inliers,
                 )
                 gt_q_np = batch["quaternion"].cpu().numpy()
 
@@ -346,6 +354,17 @@ def main():
                         help="Generate statistical analysis plots and tables")
     parser.add_argument("--stats_dir", type=str, default=None,
                         help="Directory for stats output (default: <checkpoint_dir>/stats)")
+    # PnP parameters
+    parser.add_argument("--confidence_threshold", type=float, default=0.0,
+                        help="Minimum heatmap confidence to include a keypoint "
+                             "(default: 0.0 = disabled; heatmap softmax peaks are ~0.001-0.01)")
+    parser.add_argument("--reproj_error", type=float, default=8.0,
+                        help="RANSAC reprojection error threshold in pixels (default: 8.0)")
+    parser.add_argument("--min_inliers", type=int, default=4,
+                        help="Minimum RANSAC inliers to accept a PnP solution (default: 4)")
+    parser.add_argument("--fda_test_split", action="store_true",
+                        help="Use FDA test-only split for lightbox/sunlamp "
+                             "(only if model was trained with FDA)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -418,6 +437,17 @@ def main():
         if split in pose_labels:
             pose_json = pose_labels[split]
 
+        # Only use FDA test split if explicitly requested
+        include_list = None
+        if split in ("lightbox", "sunlamp") and args.fda_test_split:
+            fda_cfg = config.get("fda", {})
+            splits_dir = Path(fda_cfg.get("splits_dir", "data/splits"))
+            test_list_path = splits_dir / f"{split}_test.txt"
+            if test_list_path.exists():
+                with open(test_list_path) as f:
+                    include_list = set(line.strip() for line in f if line.strip())
+                print(f"  Using FDA test split: {len(include_list)} images")
+
         dataset = SpeedPlusKeypointDataset(
             image_dir=str(root / split_cfg["images"]),
             label_dir=str(root / split_cfg["labels"]),
@@ -425,6 +455,7 @@ def main():
             bbox_pad_ratio=config["data"].get("bbox_pad_ratio", 0.1),
             transform=transform,
             pose_json=pose_json,
+            include_list=include_list,
         )
 
         loader = DataLoader(
@@ -440,6 +471,9 @@ def main():
             model, loader, mode, device, pnp_data,
             occluded_weight, pck_threshold,
             collect_stats=args.stats,
+            confidence_threshold=args.confidence_threshold,
+            reproj_error=args.reproj_error,
+            min_inliers=args.min_inliers,
         )
         all_results[split] = metrics
         if per_sample is not None:

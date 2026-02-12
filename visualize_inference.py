@@ -377,6 +377,17 @@ def main():
         if split in pose_labels:
             pose_json = pose_labels[split]
 
+        # Use test-only split if FDA split files exist
+        include_list = None
+        if split in ("lightbox", "sunlamp"):
+            fda_cfg = config.get("fda", {})
+            splits_dir = Path(fda_cfg.get("splits_dir", "data/splits"))
+            test_list_path = splits_dir / f"{split}_test.txt"
+            if test_list_path.exists():
+                with open(test_list_path) as f:
+                    include_list = set(line.strip() for line in f if line.strip())
+                print(f"  Using test split: {len(include_list)} images")
+
         # Dataset with transforms (for model input)
         dataset = SpeedPlusKeypointDataset(
             image_dir=str(root / split_cfg["images"]),
@@ -385,6 +396,7 @@ def main():
             bbox_pad_ratio=config["data"].get("bbox_pad_ratio", 0.1),
             transform=transform,
             pose_json=pose_json,
+            include_list=include_list,
         )
 
         random.seed(args.seed)
