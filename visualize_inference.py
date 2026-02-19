@@ -266,19 +266,7 @@ def compute_sample_metrics(model_out, sample, points_3d=None, camera_matrix=None
     px_err = compute_pixel_error(pred_kp, gt_kp, vis, crop_box)
     metrics["px_err"] = f"{px_err.item():.1f}px"
 
-    if "direct_rotation" in model_out and sample["has_pose"]:
-        pred_R = model_out["direct_rotation"].cpu()
-        pred_t = model_out["direct_translation"].cpu()
-        gt_q = sample["quaternion"].unsqueeze(0)
-        gt_t = sample["translation"].unsqueeze(0)
-        has_pose = torch.tensor([True])
-
-        rot_err = compute_rotation_error(pred_R, gt_q, has_pose)
-        trans_err = compute_translation_error(pred_t, gt_t, has_pose)
-        metrics["rot"] = f"{rot_err.item():.1f}\u00b0"
-        metrics["t_err"] = f"{trans_err.item():.3f}m"
-
-    elif points_3d is not None and sample["has_pose"]:
+    if points_3d is not None and sample["has_pose"]:
         # Extract per-keypoint confidence from heatmap peaks
         confidence = None
         if "heatmaps" in model_out:
@@ -346,8 +334,8 @@ def main():
         num_keypoints=config["data"]["num_keypoints"],
         dropout=config["model"]["dropout"],
         mode=mode,
-        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pose_pnp" else None,
-        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pose_pnp" else None,
+        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pnp" else None,
+        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pnp" else None,
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
@@ -415,7 +403,7 @@ def main():
             img_size = sample["img_size"].numpy()  # [W, H]
 
             fwd_kwargs = {"pixel_values": image_tensor}
-            if mode == "keypoint_pose_pnp":
+            if mode == "keypoint_pnp":
                 fwd_kwargs["crop_box"] = sample["crop_box"].unsqueeze(0).to(device)
                 fwd_kwargs["img_size"] = sample["img_size"].unsqueeze(0).to(device)
                 fwd_kwargs["visibility"] = sample["visibility"].unsqueeze(0).to(device)
@@ -442,12 +430,9 @@ def main():
             display_h = int(orig_h * scale)
             full_display = full_image.resize((args.display_width, display_h), Image.BILINEAR)
 
-            # Get pose data
+            # Get pose data via EPnP
             pred_R = pred_t = gt_R = gt_t = None
-            if "direct_rotation" in model_out:
-                pred_R = model_out["direct_rotation"].cpu().squeeze(0).numpy()
-                pred_t = model_out["direct_translation"].cpu().squeeze(0).numpy()
-            elif points_3d is not None:
+            if points_3d is not None:
                 # Solve pose via EPnP from predicted keypoints
                 kp_tensor = model_out["keypoints"].cpu()
                 cb_tensor = sample["crop_box"].unsqueeze(0)

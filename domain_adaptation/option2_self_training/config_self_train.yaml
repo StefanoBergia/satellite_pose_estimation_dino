@@ -1,0 +1,39 @@
+# Self-Training with Pseudo-Labels configuration
+# Uses style-split images for adaptation, test-split for evaluation ONLY
+
+self_training:
+  # Pretrained checkpoint to generate initial pseudo-labels from
+  pretrained_checkpoint: "outputs_keypoints_heatmap/best_model.pth"
+
+  # Confidence filtering: minimum heatmap peak to accept a pseudo-label
+  confidence_threshold: 0.3
+
+  # Loss weight for pseudo-labeled samples (vs 1.0 for GT-labeled)
+  pseudo_label_weight: 0.5
+
+  # Target domains to self-train on
+  target_domains:
+    - sunlamp
+    - lightbox
+
+  # Number of self-training rounds (re-generate pseudo-labels each round)
+  num_iterations: 3
+
+  # Epochs per self-training iteration
+  epochs_per_iteration: 10
+
+# Training hyperparams (lower LR for fine-tuning)
+train:
+  epochs: 10              # overridden by epochs_per_iteration
+  batch_size: 64
+  lr: 1.0e-4              # lower than initial training
+  lr_backbone: 1.0e-6     # very conservative backbone updates
+  weight_decay: 1.0e-4
+  num_workers: 2
+  output_dir: ./outputs_self_training
+
+# Splits directory
+splits_dir: "data/splits"
+
+# Base config to inherit from
+base_config: "config.yaml"

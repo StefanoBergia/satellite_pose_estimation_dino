@@ -125,6 +125,10 @@ def main():
         "--subset_size", type=int, default=None,
         help="Use only the first N samples per split (for quick testing)",
     )
+    parser.add_argument(
+        "--pretrained", type=str, default=None,
+        help="Path to a pretrained checkpoint to warm-start from (loaded with strict=False)",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -191,12 +195,26 @@ def main():
         num_keypoints=config["data"]["num_keypoints"],
         dropout=config["model"]["dropout"],
         mode=mode,
-        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pose_pnp" else None,
-        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pose_pnp" else None,
+        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pnp" else None,
+        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pnp" else None,
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
     )
+
+    # Load pretrained checkpoint (warm-start)
+    if args.pretrained:
+        print(f"Loading pretrained checkpoint: {args.pretrained}")
+        ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+        missing, unexpected = model.load_state_dict(
+            ckpt["model_state_dict"], strict=False
+        )
+        if missing:
+            print(f"  Missing keys ({len(missing)}): {missing}")
+        if unexpected:
+            print(f"  Unexpected keys ({len(unexpected)}): {unexpected}")
+        if not missing and not unexpected:
+            print("  All keys matched.")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

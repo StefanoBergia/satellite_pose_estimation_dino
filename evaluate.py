@@ -28,9 +28,6 @@ from src.utils import (
     compute_pixel_error,
     compute_pixel_rmse,
     compute_pck,
-    compute_rotation_error,
-    compute_translation_error,
-    compute_slab_score,
     load_pnp_data,
     compute_cv_pnp_slab,
     solve_pnp_batch,
@@ -125,7 +122,7 @@ def evaluate_split(model, loader, mode, device, pnp_data,
         crop_box = batch["crop_box"].to(device)
 
         fwd_kwargs = {"pixel_values": images}
-        if mode == "keypoint_pose_pnp":
+        if mode == "keypoint_pnp":
             fwd_kwargs["crop_box"] = crop_box
             fwd_kwargs["img_size"] = batch["img_size"].to(device)
             fwd_kwargs["visibility"] = vis
@@ -143,39 +140,7 @@ def evaluate_split(model, loader, mode, device, pnp_data,
         accum["px_rmse"] = accum.get("px_rmse", 0.0) + px_rmse.item()
         accum["pck"] = accum.get("pck", 0.0) + pck.item()
 
-        # Pose metrics (direct head)
         has_pose = batch["has_pose"].to(device)
-        if "direct_rotation" in model_out and has_pose.any():
-            gt_q = batch["quaternion"].to(device)
-            gt_t = batch["translation"].to(device)
-
-            rot_err = compute_rotation_error(model_out["direct_rotation"], gt_q, has_pose)
-            trans_err = compute_translation_error(model_out["direct_translation"], gt_t, has_pose)
-            accum["rot_deg"] = accum.get("rot_deg", 0.0) + rot_err.item()
-            accum["t_err"] = accum.get("t_err", 0.0) + trans_err.item()
-
-            slab = compute_slab_score(
-                model_out["direct_rotation"], model_out["direct_translation"],
-                gt_q, gt_t, has_pose,
-            )
-            accum["slab"] = accum.get("slab", 0.0) + slab["slab_score"].item()
-            accum["slab_ori"] = accum.get("slab_ori", 0.0) + slab["orientation_score"].item()
-            accum["slab_pos"] = accum.get("slab_pos", 0.0) + slab["position_score"].item()
-
-        if "pnp_rotation" in model_out and has_pose.any():
-            gt_q = batch["quaternion"].to(device)
-            gt_t = batch["translation"].to(device)
-
-            pnp_rot_err = compute_rotation_error(model_out["pnp_rotation"], gt_q, has_pose)
-            pnp_trans_err = compute_translation_error(model_out["pnp_translation"], gt_t, has_pose)
-            accum["dpnp_rot"] = accum.get("dpnp_rot", 0.0) + pnp_rot_err.item()
-            accum["dpnp_t"] = accum.get("dpnp_t", 0.0) + pnp_trans_err.item()
-
-            pnp_slab = compute_slab_score(
-                model_out["pnp_rotation"], model_out["pnp_translation"],
-                gt_q, gt_t, has_pose,
-            )
-            accum["dpnp_slab"] = accum.get("dpnp_slab", 0.0) + pnp_slab["slab_score"].item()
 
         # Extract heatmap confidence (used by both EPnP metrics and stats)
         confidence = None
@@ -408,8 +373,8 @@ def main():
         num_keypoints=config["data"]["num_keypoints"],
         dropout=config["model"]["dropout"],
         mode=mode,
-        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pose_pnp" else None,
-        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pose_pnp" else None,
+        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pnp" else None,
+        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pnp" else None,
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),

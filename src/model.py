@@ -140,57 +140,6 @@ class HeatmapKeypointHead(nn.Module):
         return {"keypoints": coords, "heatmaps": heatmaps}
 
 
-class PoseHead(nn.Module):
-    """MLP head that maps backbone features to pose (6D rotation + 3D translation).
-
-    Uses the 6D continuous rotation representation (Zhou et al., 2019):
-    predicts the first two columns of the rotation matrix, then recovers
-    the full rotation via Gram-Schmidt orthogonalization.
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dims: list[int],
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        layers = []
-        prev_dim = in_dim
-        for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
-            ])
-            prev_dim = h_dim
-        # 6D rotation + 3D translation = 9 outputs
-        layers.append(nn.Linear(prev_dim, 9))
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """
-        Args:
-            x: (B, D) feature vector
-        Returns:
-            dict with:
-                rotation: (B, 3, 3) rotation matrix
-                translation: (B, 3) translation vector
-                rot_6d: (B, 6) raw 6D rotation output (for loss)
-        """
-        out = self.mlp(x)
-        rot_6d = out[:, :6]
-        translation = out[:, 6:]
-
-        rotation = rotation_6d_to_matrix(rot_6d)
-
-        return {
-            "rotation": rotation,
-            "translation": translation,
-            "rot_6d": rot_6d,
-        }
-
-
 class DifferentiablePnP(nn.Module):
     """Differentiable Perspective-n-Point layer.
 
@@ -329,33 +278,6 @@ class DifferentiablePnP(nn.Module):
         return R, t
 
 
-def rotation_6d_to_matrix(rot_6d: torch.Tensor) -> torch.Tensor:
-    """Convert 6D rotation representation to 3x3 rotation matrix.
-
-    Uses Gram-Schmidt orthogonalization (Zhou et al., 2019).
-
-    Args:
-        rot_6d: (B, 6) first two columns of rotation matrix, flattened
-
-    Returns:
-        (B, 3, 3) proper rotation matrix
-    """
-    a1 = rot_6d[:, 0:3]
-    a2 = rot_6d[:, 3:6]
-
-    # Normalize first column
-    b1 = F.normalize(a1, dim=-1)
-
-    # Second column: subtract projection onto b1, then normalize
-    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(b2, dim=-1)
-
-    # Third column: cross product
-    b3 = torch.cross(b1, b2, dim=-1)
-
-    return torch.stack([b1, b2, b3], dim=-1)
-
-
 def quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
     """Convert SPEED+ quaternion (w, x, y, z) to body-to-camera rotation matrix.
 
@@ -388,8 +310,7 @@ class SatellitePoseModel(nn.Module):
 
     Modes:
         - "keypoint_only": only keypoint regression head
-        - "keypoint_pose": keypoint + direct pose head
-        - "keypoint_pose_pnp": keypoint + direct pose + differentiable PnP
+        - "keypoint_pnp": keypoint + differentiable PnP (pose loss refines keypoints)
     """
 
     def __init__(
@@ -440,18 +361,9 @@ class SatellitePoseModel(nn.Module):
                 dropout=dropout,
             )
 
-        # Optional: direct pose head
-        self.pose_head = None
-        if mode in ("keypoint_pose", "keypoint_pose_pnp"):
-            self.pose_head = PoseHead(
-                in_dim=hidden_size,
-                hidden_dims=head_hidden_dims,
-                dropout=dropout,
-            )
-
         # Optional: differentiable PnP
         self.diff_pnp = None
-        if mode == "keypoint_pose_pnp":
+        if mode == "keypoint_pnp":
             assert points_3d_path is not None, "points_3d_path required for PnP mode"
             assert camera_json_path is not None, "camera_json_path required for PnP mode"
 
@@ -513,7 +425,6 @@ class SatellitePoseModel(nn.Module):
             dict with available outputs depending on mode
         """
         outputs = self.backbone(pixel_values=pixel_values)
-        cls_token = outputs.pooler_output  # (B, hidden_size)
 
         result = {}
 
@@ -527,14 +438,8 @@ class SatellitePoseModel(nn.Module):
             result["keypoints"] = kp_out["keypoints"]
             result["heatmaps"] = kp_out["heatmaps"]
         else:
+            cls_token = outputs.pooler_output  # (B, hidden_size)
             result["keypoints"] = self.keypoint_head(cls_token)
-
-        # Direct pose head
-        if self.pose_head is not None:
-            pose_out = self.pose_head(cls_token)
-            result["direct_rotation"] = pose_out["rotation"]
-            result["direct_translation"] = pose_out["translation"]
-            result["direct_rot_6d"] = pose_out["rot_6d"]
 
         # Differentiable PnP
         if self.diff_pnp is not None and crop_box is not None:

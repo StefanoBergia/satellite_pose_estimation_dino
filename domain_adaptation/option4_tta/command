@@ -1,0 +1,11 @@
+python -m domain_adaptation.option4_tta.evaluate_tta \
+    --checkpoint outputs_keypoints_heatmap/best_model.pth \
+    --method tent --num_steps 10
+
+python -m domain_adaptation.option4_tta.evaluate_tta \
+    --checkpoint outputs_keypoints_heatmap/best_model.pth \
+     --method norm_adapt
+
+python -m domain_adaptation.option4_tta.evaluate_tta \
+    --checkpoint outputs_keypoints_heatmap/best_model.pth \
+    --method memo --memo_augmentations 8 --num_steps 10

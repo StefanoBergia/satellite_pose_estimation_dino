@@ -5,66 +5,16 @@ Usage:
 """
 
 import argparse
-import json
 import random
 from pathlib import Path
 
-import numpy as np
 import torch
 import yaml
-from PIL import ImageDraw
 
 from src.dataset import SpeedPlusKeypointDataset
 from src.transforms import KeypointTransform
-from src.model import SatellitePoseModel, quaternion_to_matrix
+from src.model import SatellitePoseModel
 from src.utils import visualize_keypoints, visualize_heatmaps
-
-
-def draw_axes(
-    draw: ImageDraw.ImageDraw,
-    rotation: np.ndarray,
-    translation: np.ndarray,
-    camera_matrix: np.ndarray,
-    crop_box: np.ndarray,
-    viz_w: int,
-    viz_h: int,
-    axis_length: float = 0.3,
-    line_width: int = 3,
-):
-    """Draw projected 3D coordinate axes on the visualization image.
-
-    Colors: X=red, Y=green, Z=blue
-    """
-    fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
-    cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
-
-    origin = translation
-    axes_3d = [
-        translation + rotation[:, 0] * axis_length,  # X
-        translation + rotation[:, 1] * axis_length,  # Y
-        translation + rotation[:, 2] * axis_length,  # Z
-    ]
-
-    def project(pt3d):
-        if pt3d[2] <= 0:
-            return None
-        u = fx * pt3d[0] / pt3d[2] + cx
-        v = fy * pt3d[1] / pt3d[2] + cy
-        x1, y1, x2, y2 = crop_box
-        crop_w, crop_h = x2 - x1, y2 - y1
-        u_viz = (u - x1) / crop_w * viz_w
-        v_viz = (v - y1) / crop_h * viz_h
-        return (u_viz, v_viz)
-
-    origin_2d = project(origin)
-    if origin_2d is None:
-        return
-
-    colors = ["red", "green", "blue"]
-    for ax, color in zip(axes_3d, colors):
-        end_2d = project(ax)
-        if end_2d is not None:
-            draw.line([origin_2d, end_2d], fill=color, width=line_width)
 
 
 def main():
@@ -126,15 +76,8 @@ def main():
         include_list=include_list,
     )
 
-    # Load camera matrix for pose axis drawing
-    camera_matrix = None
-    geo_cfg = config.get("geometry", {})
-    if mode != "keypoint_only" and geo_cfg.get("camera"):
-        with open(geo_cfg["camera"], "r") as f:
-            cam_data = json.load(f)
-        camera_matrix = np.array(cam_data["cameraMatrix"], dtype=np.float32)
-
     # Load model
+    geo_cfg = config.get("geometry", {})
     pose_cfg = config.get("pose", {})
     model = SatellitePoseModel(
         backbone_name=config["model"]["backbone"],
@@ -143,8 +86,8 @@ def main():
         num_keypoints=config["data"]["num_keypoints"],
         dropout=config["model"]["dropout"],
         mode=mode,
-        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pose_pnp" else None,
-        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pose_pnp" else None,
+        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pnp" else None,
+        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pnp" else None,
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
@@ -174,7 +117,7 @@ def main():
 
         # Build forward kwargs
         fwd_kwargs = {"pixel_values": image_tensor}
-        if mode == "keypoint_pose_pnp":
+        if mode == "keypoint_pnp":
             fwd_kwargs["crop_box"] = sample["crop_box"].unsqueeze(0).to(device)
             fwd_kwargs["img_size"] = sample["img_size"].unsqueeze(0).to(device)
             fwd_kwargs["visibility"] = sample["visibility"].unsqueeze(0).to(device)
@@ -191,24 +134,6 @@ def main():
 
         # Draw keypoints
         viz = visualize_keypoints(raw_crop, pred_kp, gt_kp, vis, radius=5)
-
-        # Draw predicted pose axes
-        if camera_matrix is not None and "direct_rotation" in model_out:
-            pred_R = model_out["direct_rotation"].cpu().squeeze(0).numpy()
-            pred_t = model_out["direct_translation"].cpu().squeeze(0).numpy()
-            draw = ImageDraw.Draw(viz)
-            draw_axes(draw, pred_R, pred_t, camera_matrix, crop_box, viz_size, viz_size,
-                      axis_length=0.3, line_width=3)
-
-            # Draw GT pose axes (thinner, shorter) if available
-            if sample["has_pose"]:
-                gt_q = sample["quaternion"].numpy()
-                gt_R = quaternion_to_matrix(
-                    torch.tensor(gt_q).unsqueeze(0)
-                ).squeeze(0).numpy()
-                gt_t = sample["translation"].numpy()
-                draw_axes(draw, gt_R, gt_t, camera_matrix, crop_box, viz_size, viz_size,
-                          axis_length=0.2, line_width=1)
 
         viz.save(out_dir / f"{args.split}_{idx:05d}.png")
 

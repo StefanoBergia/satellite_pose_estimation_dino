@@ -1,9 +1,58 @@
+# Python
+__pycache__/
+src/__pycache__/*
+src/__pycache__/model.cpython-311.pyc
+src/__pycache__/trainer.cpython-311.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
 .venv/
-outputs/
-outputs_head_pose_pnp/
-outputs_keypoints/
-outputs_keypoints_heatmap
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Images & videos
 *.png
-slurm/
-src/__pycache__/fda.cpython-311.pyc
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.mp4
+*.avi
+
+# Model weights & checkpoints
+*.pth
+*.pt
+*.onnx
+*.bin
+*.safetensors
+weights/
+models/
+
+# Training output folders
+outputs/
+outputs_old/
+outputs_keypoints/
+outputs_keypoints_heatmap/
 outputs_keypoints_heatmap_FDA/
+outputs_head_pose_pnp/
+outputs_domain_generalization/
+outputs_self_training/
+outputs_self_training_dg/
+train_sunlamp_style/
+
+# SLURM logs
+slurm/logs/
+
+# TensorBoard logs
+logs/
+events.out.tfevents.*
+
+# Misc
+.source

@@ -110,6 +110,7 @@ def solve_pnp_robust(
     pts_2d = kp_px[mask].reshape(-1, 1, 2)
     pts_3d = points_3d[mask].reshape(-1, 1, 3)
 
+    cv2.setRNGSeed(42)
     ok, rvec, tvec, inliers = cv2.solvePnPRansac(
         pts_3d, pts_2d, camera_matrix, dist_coeffs,
         flags=cv2.SOLVEPNP_EPNP,
@@ -134,6 +135,7 @@ def solve_pnp_robust(
         pts_2d = kp_px[vis_mask].reshape(-1, 1, 2)
         pts_3d = points_3d[vis_mask].reshape(-1, 1, 3)
 
+        cv2.setRNGSeed(42)
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(
             pts_3d, pts_2d, camera_matrix, dist_coeffs,
             flags=cv2.SOLVEPNP_EPNP,
@@ -183,9 +185,12 @@ def compute_pose_errors(R, t, gt_q, gt_t):
     err_pos_rel = np.linalg.norm(t - gt_t) / max(np.linalg.norm(gt_t), 1e-8)
     pos_score = 0.0 if err_pos_rel < 0.002173 else float(err_pos_rel)
 
+    err_pos_abs = float(np.linalg.norm(t - gt_t))
+
     return {
         "rot_deg": float(np.degrees(err_orient)),
         "pos_rel": float(err_pos_rel),
+        "pos_abs": err_pos_abs,
         "orient_score": orient_score,
         "pos_score": pos_score,
         "slab": orient_score + pos_score,
@@ -220,7 +225,7 @@ def evaluate_split(model, loader, mode, device, pnp_data,
         crop_box = batch["crop_box"].to(device)
 
         fwd_kwargs = {"pixel_values": images}
-        if mode == "keypoint_pose_pnp":
+        if mode == "keypoint_pnp":
             fwd_kwargs["crop_box"] = crop_box
             fwd_kwargs["img_size"] = batch["img_size"].to(device)
             fwd_kwargs["visibility"] = vis
@@ -345,8 +350,11 @@ def print_results_table(all_results, mode, epoch, settings):
     print(f"{'':=<120}")
 
     keys = ["loss", "px_err", "px_rmse", "pck",
-            "epnp_slab", "epnp_ori", "epnp_pos", "epnp_rot",
-            "epnp_t", "solved%", "dropped"]
+            "epnp_slab", "epnp_ori", "epnp_pos(%)", "epnp_rot(°)",
+            "epnp_t(m)", "solved%", "dropped"]
+    data_keys = ["loss", "px_err", "px_rmse", "pck",
+                 "epnp_slab", "epnp_ori", "epnp_pos", "epnp_rot",
+                 "epnp_t", "solved%", "dropped"]
 
     col_w = 13
     split_w = 12
@@ -359,14 +367,14 @@ def print_results_table(all_results, mode, epoch, settings):
 
     for split, metrics in all_results.items():
         row = f"{split:<{split_w}}"
-        for k in keys:
+        for k in data_keys:
             if k in metrics:
                 v = metrics[k]
                 if k == "dropped":
                     row += f"{int(v):>{col_w}d}"
                 elif "%" in k or "pck" in k:
                     row += f"{v:>{col_w}.4f}"
-                elif "rot" in k:
+                elif k == "epnp_rot":
                     row += f"{v:>{col_w}.2f}"
                 else:
                     row += f"{v:>{col_w}.4f}"
@@ -387,8 +395,11 @@ def save_results(all_results, output_path, mode, epoch, settings):
     lines.append("")
 
     keys = ["loss", "px_err", "px_rmse", "pck",
-            "epnp_slab", "epnp_ori", "epnp_pos", "epnp_rot",
-            "epnp_t", "solved%", "dropped"]
+            "epnp_slab", "epnp_ori", "epnp_pos(%)", "epnp_rot(°)",
+            "epnp_t(m)", "solved%", "dropped"]
+    data_keys = ["loss", "px_err", "px_rmse", "pck",
+                 "epnp_slab", "epnp_ori", "epnp_pos", "epnp_rot",
+                 "epnp_t", "solved%", "dropped"]
 
     col_w = 13
     split_w = 12
@@ -401,14 +412,14 @@ def save_results(all_results, output_path, mode, epoch, settings):
 
     for split, metrics in all_results.items():
         row = f"{split:<{split_w}}"
-        for k in keys:
+        for k in data_keys:
             if k in metrics:
                 v = metrics[k]
                 if k == "dropped":
                     row += f"{int(v):>{col_w}d}"
                 elif "%" in k or "pck" in k:
                     row += f"{v:>{col_w}.4f}"
-                elif "rot" in k:
+                elif k == "epnp_rot":
                     row += f"{v:>{col_w}.2f}"
                 else:
                     row += f"{v:>{col_w}.4f}"
@@ -447,9 +458,13 @@ def main():
                         help="RANSAC reprojection error in pixels (default: 15.0)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output results file (default: <checkpoint_dir>/results_robust.txt)")
-    parser.add_argument("--fda_test_split", action="store_true",
-                        help="Use FDA test-only split for lightbox/sunlamp "
-                             "(only if model was trained with FDA)")
+    parser.add_argument("--test_split", action="store_true",
+                        help="For lightbox/sunlamp, evaluate only on the test subset "
+                             "(data/splits/{split}_test.txt), excluding the style subset. "
+                             "Use this to avoid evaluating on images used for adaptation.")
+    parser.add_argument("--splits_dir", type=str, default="data/splits",
+                        help="Directory containing *_test.txt and *_style.txt files "
+                             "(used with --test_split, default: data/splits)")
 
     args = parser.parse_args()
 
@@ -497,13 +512,15 @@ def main():
         num_keypoints=config["data"]["num_keypoints"],
         dropout=config["model"]["dropout"],
         mode=mode,
-        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pose_pnp" else None,
-        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pose_pnp" else None,
+        points_3d_path=geo_cfg.get("points_3d") if mode == "keypoint_pnp" else None,
+        camera_json_path=geo_cfg.get("camera") if mode == "keypoint_pnp" else None,
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
     )
-    model.load_state_dict(ckpt["model_state_dict"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if unexpected:
+        print(f"  Ignoring {len(unexpected)} unexpected keys (e.g. DSU/MixStyle modules)")
     model.to(device)
     model.eval()
 
@@ -524,16 +541,18 @@ def main():
         if split in pose_labels:
             pose_json = pose_labels[split]
 
-        # Only use FDA test split if explicitly requested
+        # Optionally restrict to test subset (excluding style/adaptation images)
         include_list = None
-        if split in ("lightbox", "sunlamp") and args.fda_test_split:
-            fda_cfg = config.get("fda", {})
-            splits_dir = Path(fda_cfg.get("splits_dir", "data/splits"))
-            test_list_path = splits_dir / f"{split}_test.txt"
-            if test_list_path.exists():
-                with open(test_list_path) as f:
-                    include_list = set(line.strip() for line in f if line.strip())
-                print(f"  Using FDA test split: {len(include_list)} images")
+        if split in ("lightbox", "sunlamp"):
+            if args.test_split:
+                test_list_path = Path(args.splits_dir) / f"{split}_test.txt"
+                if test_list_path.exists():
+                    with open(test_list_path) as f:
+                        include_list = set(line.strip() for line in f if line.strip())
+                    print(f"  Using test split only: {len(include_list)} images "
+                          f"(excluded style subset)")
+                else:
+                    print(f"  WARNING: {test_list_path} not found, using full split")
 
         dataset = SpeedPlusKeypointDataset(
             image_dir=str(root / split_cfg["images"]),
@@ -581,7 +600,7 @@ def main():
             mean_ori = np.mean([e["orient_score"] for e in solved_errors])
             mean_pos = np.mean([e["pos_score"] for e in solved_errors])
             mean_rot = np.mean([e["rot_deg"] for e in solved_errors])
-            mean_t = np.mean([e["pos_rel"] for e in solved_errors])
+            mean_t = np.mean([e["pos_abs"] for e in solved_errors])
         else:
             mean_slab = mean_ori = mean_pos = mean_rot = mean_t = 0.0
 

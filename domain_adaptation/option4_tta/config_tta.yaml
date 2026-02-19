@@ -1,0 +1,24 @@
+# Test-Time Adaptation configuration
+# No retraining needed — works with any existing checkpoint
+
+tta:
+  method: "tent"           # "tent" | "norm_adapt" | "memo"
+  num_steps: 10             # gradient steps for TENT per batch
+  lr: 1.0e-4               # learning rate for TENT (only LayerNorm affine params)
+  batch_size: 32           # batch size for TTA adaptation pass
+  entropy_threshold: 0.0   # skip samples with entropy below this (0 = disabled)
+
+  # MEMO-specific
+  memo_num_augmentations: 8
+  memo_num_steps: 1
+
+  # Target domains to adapt to
+  target_domains:
+    - sunlamp
+    - lightbox
+
+# Checkpoint to adapt (set this to your best model)
+pretrained_checkpoint: "outputs_keypoints_heatmap/best_model.pth"
+
+# Splits directory (for style/test separation)
+splits_dir: "data/splits"

@@ -20,10 +20,9 @@ from .utils import (
 class Trainer:
     """Training loop for keypoint + pose estimation model.
 
-    Supports three modes:
+    Supports two modes:
         - keypoint_only: only keypoint MSE loss
-        - keypoint_pose: keypoint + direct pose loss
-        - keypoint_pose_pnp: keypoint + direct pose + PnP pose loss (with warmup)
+        - keypoint_pnp: keypoint + differentiable PnP pose loss (with warmup)
     """
 
     def __init__(
@@ -51,7 +50,6 @@ class Trainer:
         # Loss weights
         pose_cfg = config.get("pose", {})
         self.lambda_kp = pose_cfg.get("lambda_keypoint", 1.0)
-        self.lambda_direct = pose_cfg.get("lambda_direct_pose", 1.0)
         self.lambda_pnp = pose_cfg.get("lambda_pnp_pose", 0.5)
         self.rot_weight = pose_cfg.get("rotation_weight", 1.0)
         self.trans_weight = pose_cfg.get("translation_weight", 1.0)
@@ -68,8 +66,6 @@ class Trainer:
         # Optimizer with separate param groups
         backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
         head_params = list(model.keypoint_head.parameters())
-        if model.pose_head is not None:
-            head_params += list(model.pose_head.parameters())
 
         param_groups = [
             {"params": head_params, "lr": config["train"]["lr"]},
@@ -95,7 +91,7 @@ class Trainer:
 
     def _get_pnp_weight(self, epoch: int) -> float:
         """Compute PnP loss weight with warmup + linear ramp-up."""
-        if self.mode != "keypoint_pose_pnp":
+        if self.mode != "keypoint_pnp":
             return 0.0
         if epoch <= self.pnp_warmup_epochs:
             return 0.0
@@ -111,7 +107,7 @@ class Trainer:
             for name, val in train_losses.items():
                 self.writer.add_scalar(f"train/{name}", val, epoch)
             self.writer.add_scalar("train/lr_head", self.optimizer.param_groups[0]["lr"], epoch)
-            if self.mode == "keypoint_pose_pnp":
+            if self.mode == "keypoint_pnp":
                 self.writer.add_scalar("train/pnp_weight", self._get_pnp_weight(epoch), epoch)
 
             # Evaluate on all splits
@@ -127,10 +123,10 @@ class Trainer:
                     f"px_err={metrics['pixel_error']:.2f}  "
                     f"pck={metrics['pck']:.4f}"
                 )
-                if "rot_error_deg" in metrics:
-                    msg += f"  rot={metrics['rot_error_deg']:.2f}deg  t_err={metrics['trans_error']:.4f}"
-                if "slab_score" in metrics:
-                    msg += f"  SLAB={metrics['slab_score']:.4f}"
+                if "pnp_rot_error_deg" in metrics:
+                    msg += f"  rot={metrics['pnp_rot_error_deg']:.2f}deg  t_err={metrics['pnp_trans_error']:.4f}"
+                if "pnp_slab_score" in metrics:
+                    msg += f"  SLAB={metrics['pnp_slab_score']:.4f}"
                 print(msg)
 
             # Save best model (reuse metrics already computed above)
@@ -172,24 +168,8 @@ class Trainer:
             total = total + self.lambda_heatmap * hm_loss
             log["heatmap_loss"] = hm_loss.item()
 
-        # Direct pose loss
-        if self.mode in ("keypoint_pose", "keypoint_pose_pnp"):
-            gt_q = batch["quaternion"].to(self.device)
-            gt_t = batch["translation"].to(self.device)
-            has_pose = batch["has_pose"].to(self.device)
-
-            direct_losses = combined_pose_loss(
-                model_out["direct_rotation"],
-                model_out["direct_translation"],
-                gt_q, gt_t, has_pose,
-                self.rot_weight, self.trans_weight,
-            )
-            total = total + self.lambda_direct * direct_losses["pose_loss"]
-            log["direct_rot_loss"] = direct_losses["rotation_loss"].item()
-            log["direct_trans_loss"] = direct_losses["translation_loss"].item()
-
         # PnP pose loss (with warmup)
-        if self.mode == "keypoint_pose_pnp" and "pnp_rotation" in model_out:
+        if self.mode == "keypoint_pnp" and "pnp_rotation" in model_out:
             gt_q = batch["quaternion"].to(self.device)
             gt_t = batch["translation"].to(self.device)
             has_pose = batch["has_pose"].to(self.device)
@@ -220,7 +200,7 @@ class Trainer:
 
             # Build model forward kwargs
             fwd_kwargs = {"pixel_values": images}
-            if self.mode == "keypoint_pose_pnp":
+            if self.mode == "keypoint_pnp":
                 fwd_kwargs["crop_box"] = batch["crop_box"].to(self.device)
                 fwd_kwargs["img_size"] = batch["img_size"].to(self.device)
                 fwd_kwargs["visibility"] = batch["visibility"].to(self.device)
@@ -254,7 +234,7 @@ class Trainer:
             crop_box = batch["crop_box"].to(self.device)
 
             fwd_kwargs = {"pixel_values": images}
-            if self.mode == "keypoint_pose_pnp":
+            if self.mode == "keypoint_pnp":
                 fwd_kwargs["crop_box"] = crop_box
                 fwd_kwargs["img_size"] = batch["img_size"].to(self.device)
                 fwd_kwargs["visibility"] = vis
@@ -272,31 +252,8 @@ class Trainer:
             accum["pixel_error"] = accum.get("pixel_error", 0.0) + px_err.item()
             accum["pck"] = accum.get("pck", 0.0) + pck.item()
 
-            # Pose metrics (if available)
+            # PnP pose metrics (keypoint_pnp mode)
             has_pose = batch["has_pose"].to(self.device)
-            if "direct_rotation" in model_out and has_pose.any():
-                gt_q = batch["quaternion"].to(self.device)
-                gt_t = batch["translation"].to(self.device)
-
-                rot_err = compute_rotation_error(
-                    model_out["direct_rotation"], gt_q, has_pose
-                )
-                trans_err = compute_translation_error(
-                    model_out["direct_translation"], gt_t, has_pose
-                )
-                accum["rot_error_deg"] = accum.get("rot_error_deg", 0.0) + rot_err.item()
-                accum["trans_error"] = accum.get("trans_error", 0.0) + trans_err.item()
-
-                # SLAB score
-                slab = compute_slab_score(
-                    model_out["direct_rotation"],
-                    model_out["direct_translation"],
-                    gt_q, gt_t, has_pose,
-                )
-                accum["slab_score"] = accum.get("slab_score", 0.0) + slab["slab_score"].item()
-                accum["slab_orient"] = accum.get("slab_orient", 0.0) + slab["orientation_score"].item()
-                accum["slab_pos"] = accum.get("slab_pos", 0.0) + slab["position_score"].item()
-
             if "pnp_rotation" in model_out and has_pose.any():
                 gt_q = batch["quaternion"].to(self.device)
                 gt_t = batch["translation"].to(self.device)
