@@ -1,3 +1,31 @@
+# =============================================================================
+# Jetson TensorRT Export & Benchmark — Docker Compose
+# ARM64 only: run all commands directly on the Jetson device.
+# =============================================================================
+#
+# BUILD IMAGE (once):
+#   docker compose -f docker-compose.jetson.yml build
+#
+# VERIFY CUDA:
+#   docker compose -f docker-compose.jetson.yml run --rm trt-export python -c "import torch; print(torch.cuda.is_available())"
+#
+# EXPORT ONNX + TRT FP16:
+#   docker compose -f docker-compose.jetson.yml run --rm trt-export python export_hrnet_tensorrt.py --config config_hrnet_w32.yaml --checkpoint outputs_hrnet_w32/converted_model.pth --build_trt --fp16
+#
+# EXPORT ONNX + TRT FP32:
+#   docker compose -f docker-compose.jetson.yml run --rm trt-export python export_hrnet_tensorrt.py --config config_hrnet_w32.yaml --checkpoint outputs_hrnet_w32/converted_model.pth --build_trt --output_trt hrnet_w32_fp32.engine
+#
+# FPS BENCHMARK — FP16:
+#   docker compose -f docker-compose.jetson.yml run --rm trt-export python evaluate_trt.py --engine hrnet_w32.engine --config config_hrnet_w32.yaml --benchmark --batch_sizes 1 2 4 8
+#
+# FPS BENCHMARK — FP32:
+#   docker compose -f docker-compose.jetson.yml run --rm trt-export python evaluate_trt.py --engine hrnet_w32_fp32.engine --config config_hrnet_w32.yaml --benchmark --batch_sizes 1 2 4 8
+#
+# EVALUATE TRT (accuracy, colleague-aligned PnP settings):
+#   docker compose -f docker-compose.jetson.yml run --rm trt-export python evaluate_trt.py --engine hrnet_w32.engine --config config_hrnet_w32.yaml --gt_crop --crop_pnp --resize_first --kpt_extractor argmax --reproj_error 8 --ransac_confidence 0.999 --ransac_iterations 100 --min_kpt_area 0 --t_ratio_max 20 --refine_lm 1 --refine_retrim 1 --min_inliers_schedule "" --rmse_inliers_thr 0 --no_conf_filter --output outputs_hrnet_w32/results_trt.txt
+#
+# =============================================================================
+
 services:
   trt-export:
     build:
