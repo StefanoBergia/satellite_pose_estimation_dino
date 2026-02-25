@@ -1,0 +1,12 @@
+# Jetson Orin – JetPack 6 (CUDA 12.2, PyTorch 2.2, Python 3.10)
+# For JetPack 5, replace with: nvcr.io/nvidia/l4t-pytorch:r35.4.1-pth2.1-py3
+FROM nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.2-py3
+
+# Extra packages not in the base image
+# torch, numpy, onnxruntime-gpu already included in base
+RUN pip install --no-cache-dir \
+    timm>=0.9 \
+    transformers>=4.36 \
+    pyyaml \
+    onnx>=1.14 \
+    Pillow

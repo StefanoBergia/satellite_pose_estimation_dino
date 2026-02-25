@@ -1,0 +1,12 @@
+services:
+  trt-export:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
