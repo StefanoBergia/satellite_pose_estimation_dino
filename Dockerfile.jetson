@@ -1,6 +1,7 @@
-# Jetson Orin – JetPack 6 (CUDA 12.2, PyTorch 2.2, Python 3.10)
-# For JetPack 5, replace with: nvcr.io/nvidia/l4t-pytorch:r35.4.1-pth2.1-py3
-FROM nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.2-py3
+# Jetson Orin – JetPack 6 (ARM64 only – build/run on Jetson, not x86_64)
+# l4t-pytorch is discontinued for JetPack 6; use the unified igpu tag instead.
+# For JetPack 5, use: nvcr.io/nvidia/l4t-pytorch:r35.2.1-pth2.0-py3
+FROM nvcr.io/nvidia/pytorch:25.03-py3-igpu
 
 # Extra packages not in the base image
 # torch, numpy, onnxruntime-gpu already included in base
