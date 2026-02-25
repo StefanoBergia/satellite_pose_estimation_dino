@@ -7,7 +7,7 @@ import sys
 
 from tqdm import tqdm
 
-from .losses import visibility_weighted_mse, combined_pose_loss, heatmap_mse_loss
+from .losses import visibility_weighted_mse, combined_pose_loss, heatmap_mse_loss, heatmap_msssim_loss
 from .utils import (
     compute_pixel_error,
     compute_pck,
@@ -59,6 +59,13 @@ class Trainer:
         self.heatmap_size = pose_cfg.get("heatmap_size", 64)
         self.heatmap_sigma = pose_cfg.get("heatmap_sigma", 1.5)
 
+        # MS-SSIM heatmap loss with curriculum scheduling
+        self.lambda_msssim = pose_cfg.get("lambda_msssim", 0.0)
+        self.msssim_warmup_epochs = pose_cfg.get("msssim_warmup_epochs", 5)
+        self.msssim_rampup_epochs = pose_cfg.get("msssim_rampup_epochs", 10)
+        self.msssim_win_size = pose_cfg.get("msssim_win_size", 7)
+        self.msssim_num_scales = pose_cfg.get("msssim_num_scales", None)
+
         # PnP warmup: start PnP loss after this many epochs
         self.pnp_warmup_epochs = pose_cfg.get("pnp_warmup_epochs", 10)
         self.pnp_rampup_epochs = pose_cfg.get("pnp_rampup_epochs", 10)
@@ -98,6 +105,15 @@ class Trainer:
         ramp = min(1.0, (epoch - self.pnp_warmup_epochs) / max(self.pnp_rampup_epochs, 1))
         return self.lambda_pnp * ramp
 
+    def _get_msssim_weight(self, epoch: int) -> float:
+        """Compute MS-SSIM loss weight with warmup + linear ramp-up."""
+        if self.lambda_msssim <= 0:
+            return 0.0
+        if epoch <= self.msssim_warmup_epochs:
+            return 0.0
+        ramp = min(1.0, (epoch - self.msssim_warmup_epochs) / max(self.msssim_rampup_epochs, 1))
+        return self.lambda_msssim * ramp
+
     def train(self):
         for epoch in range(1, self.epochs + 1):
             train_losses = self._train_epoch(epoch)
@@ -109,6 +125,8 @@ class Trainer:
             self.writer.add_scalar("train/lr_head", self.optimizer.param_groups[0]["lr"], epoch)
             if self.mode == "keypoint_pnp":
                 self.writer.add_scalar("train/pnp_weight", self._get_pnp_weight(epoch), epoch)
+            if self.lambda_msssim > 0:
+                self.writer.add_scalar("train/msssim_weight", self._get_msssim_weight(epoch), epoch)
 
             # Evaluate on all splits
             all_metrics = {}
@@ -167,6 +185,19 @@ class Trainer:
             )
             total = total + self.lambda_heatmap * hm_loss
             log["heatmap_loss"] = hm_loss.item()
+
+        # MS-SSIM heatmap loss (with curriculum scheduling)
+        msssim_weight = self._get_msssim_weight(epoch)
+        if "heatmaps" in model_out and msssim_weight > 0:
+            msssim_loss = heatmap_msssim_loss(
+                model_out["heatmaps"], gt_kp, vis,
+                self.heatmap_size, self.heatmap_sigma,
+                win_size=self.msssim_win_size,
+                num_scales=self.msssim_num_scales,
+                occluded_weight=self.occluded_weight,
+            )
+            total = total + msssim_weight * msssim_loss
+            log["msssim_loss"] = msssim_loss.item()
 
         # PnP pose loss (with warmup)
         if self.mode == "keypoint_pnp" and "pnp_rotation" in model_out:

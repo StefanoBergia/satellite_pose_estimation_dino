@@ -1,0 +1,33 @@
+# Domain Generalization configuration for HRNet backbone (DSU + MixStyle)
+# Trains ONLY on synthetic data — no target domain images needed.
+# Injects DSU and MixStyle into HRNet BatchNorm2d layers (last N stages).
+
+# Domain generalization modules
+domain_generalization:
+  enable_dsu: true
+  enable_mixstyle: true
+  # DSU: feature statistics perturbation
+  dsu_alpha: 0.3          # mean perturbation strength
+  dsu_beta: 0.3           # std perturbation strength
+  # MixStyle: feature statistics mixing
+  mixstyle_prob: 0.5      # probability of applying MixStyle per forward pass
+  mixstyle_alpha: 0.1     # Beta distribution parameter
+  # For HRNet: number of final stages to inject (HRNet has 4 stages).
+  # 2 = inject into stage3 + stage4 (highest-level stages, most semantic).
+  apply_to_last_n_blocks: 2
+  # "after_bn" is informational for HRNet — hooks target each stage as a whole (1 hook per stage).
+  # For DINOv3 use "after_ln1" or "after_ln2".
+  injection_point: "after_bn"
+
+# Override base config for DG training
+train:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-3
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  num_workers: 2
+  output_dir: ./outputs_hrnet_domain_generalization
+
+# Base config to inherit from (HRNet config)
+base_config: "config_hrnet_w32.yaml"

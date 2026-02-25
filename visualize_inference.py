@@ -339,6 +339,8 @@ def main():
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
+        backbone_type=config["model"].get("backbone_type", "dinov3"),
+        hrnet_pretrained=config["model"].get("hrnet_pretrained", None),
     )
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -351,7 +353,10 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    transform = KeypointTransform(image_size=config["data"]["image_size"], is_train=False)
+    transform = KeypointTransform(
+        image_size=config["data"]["image_size"], is_train=False,
+        imagenet_normalize=config["data"].get("imagenet_normalize", True),
+    )
 
     for split in args.splits:
         if split not in config["data"]["splits"]:

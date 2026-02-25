@@ -37,7 +37,11 @@ class MixStyle(nn.Module):
         if B < 2:
             return x  # need at least 2 samples to mix
 
-        if x.dim() == 3:
+        if x.dim() == 4:
+            # (B, C, H, W) — CNN feature map (e.g. HRNet)
+            mu = x.mean(dim=(2, 3), keepdim=True)    # (B, C, 1, 1)
+            sigma = x.std(dim=(2, 3), keepdim=True) + self.eps  # (B, C, 1, 1)
+        elif x.dim() == 3:
             # (B, N, D)
             mu = x.mean(dim=1, keepdim=True)    # (B, 1, D)
             sigma = x.std(dim=1, keepdim=True) + self.eps  # (B, 1, D)
@@ -51,9 +55,15 @@ class MixStyle(nn.Module):
         # Normalize
         x_norm = (x - mu) / sigma
 
-        # Sample mixing coefficient
+        # Sample mixing coefficient — shape must broadcast with mu/sigma
+        if x.dim() == 4:
+            lmda_shape = (B, 1, 1, 1)  # (B, C, H, W) broadcast
+        elif x.dim() == 3:
+            lmda_shape = (B, 1, 1)
+        else:
+            lmda_shape = (B, 1)
         lmda = torch.distributions.Beta(self.alpha, self.alpha).sample(
-            (B, 1, 1) if x.dim() == 3 else (B, 1)
+            lmda_shape
         ).to(x.device)
 
         # Random permutation for pairing

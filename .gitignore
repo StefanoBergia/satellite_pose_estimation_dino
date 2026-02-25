@@ -35,6 +35,15 @@ build/
 weights/
 models/
 
+# TensorRT serialized engines (large binary, platform-specific)
+*.engine
+
+# ONNX external weight data (split-format sidecar files)
+*.onnx.data
+
+# INT8 calibration cache
+*.cache
+
 # Training output folders
 outputs/
 outputs_old/
@@ -46,6 +55,9 @@ outputs_domain_generalization/
 outputs_self_training/
 outputs_self_training_dg/
 train_sunlamp_style/
+outputs_dino_msssim/
+outputs_hrnet_heatmap/
+outputs_hrnet_w32/
 
 # SLURM logs
 slurm/logs/
@@ -53,6 +65,10 @@ slurm/logs/
 # TensorBoard logs
 logs/
 events.out.tfevents.*
+
+# Evaluation / benchmark result files (outputs, not source)
+results_*.txt
+*_results.txt
 
 # Misc
 .source

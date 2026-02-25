@@ -25,6 +25,7 @@ def build_dataset(
     transform = KeypointTransform(
         image_size=config["data"]["image_size"],
         is_train=is_train,
+        imagenet_normalize=config["data"].get("imagenet_normalize", True),
         color_jitter=aug_cfg.get("color_jitter", 0.3) if is_train else 0.0,
         gaussian_blur_prob=aug_cfg.get("gaussian_blur_prob", 0.0) if is_train else 0.0,
         gaussian_blur_kernel=tuple(aug_cfg.get("gaussian_blur_kernel", [3, 7])),
@@ -200,6 +201,8 @@ def main():
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
+        backbone_type=config["model"].get("backbone_type", "dinov3"),
+        hrnet_pretrained=config["model"].get("hrnet_pretrained", None),
     )
 
     # Load pretrained checkpoint (warm-start)

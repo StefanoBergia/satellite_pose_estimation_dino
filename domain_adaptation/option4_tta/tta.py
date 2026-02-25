@@ -44,13 +44,24 @@ def heatmap_entropy(heatmaps: torch.Tensor) -> torch.Tensor:
 # Method 1: Norm Adaptation
 # ---------------------------------------------------------------------------
 
+def collect_norm_modules(model):
+    """Find all normalization modules in the backbone.
+
+    Returns LayerNorm modules for DINOv3, BatchNorm2d modules for HRNet.
+    Automatically detects backbone type from model.backbone_type attribute.
+    """
+    backbone_type = getattr(model, "backbone_type", "dinov3")
+    norm_cls = nn.BatchNorm2d if backbone_type in ("hrnet", "hrnet_w32") else nn.LayerNorm
+    return [
+        (name, module)
+        for name, module in model.backbone.named_modules()
+        if isinstance(module, norm_cls)
+    ]
+
+
+# Keep old name as alias for backward compatibility
 def collect_layernorm_modules(model):
-    """Find all LayerNorm modules in the ViT backbone."""
-    ln_modules = []
-    for name, module in model.backbone.named_modules():
-        if isinstance(module, nn.LayerNorm):
-            ln_modules.append((name, module))
-    return ln_modules
+    return collect_norm_modules(model)
 
 
 class NormAdapt:
@@ -68,15 +79,35 @@ class NormAdapt:
     def adapt(self, loader, device, num_batches=None):
         """Run forward passes to collect target domain statistics.
 
-        Replaces LayerNorm weight/bias with values fitted to target data:
-        - Computes running mean/var of pre-norm activations
-        - Adjusts LayerNorm affine params to re-center/re-scale
+        For DINOv3 (LayerNorm): adjusts affine params to re-center activations.
+        For HRNet (BatchNorm2d): updates running_mean/running_var using target data
+          by running BN layers in train mode (the standard BN adaptation trick).
         """
         self.original_state = copy.deepcopy(self.model.state_dict())
-        self.model.eval()
+        backbone_type = getattr(self.model, "backbone_type", "dinov3")
 
-        # Collect output statistics for each LayerNorm via hooks
-        ln_modules = collect_layernorm_modules(self.model)
+        if backbone_type in ("hrnet", "hrnet_w32"):
+            # BN adaptation: set BN layers to train mode to update running stats
+            self.model.eval()
+            for module in self.model.backbone.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.train()  # enables running stat updates
+
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(loader, desc="NormAdapt (BN): updating stats")):
+                    if num_batches is not None and i >= num_batches:
+                        break
+                    images = batch["image"].to(device)
+                    self.model(pixel_values=images)
+
+            self.model.eval()
+            norm_modules = collect_norm_modules(self.model)
+            print(f"NormAdapt (BN): updated running stats for {len(norm_modules)} BatchNorm2d layers")
+            return
+
+        # DINOv3 path: LayerNorm stat collection via hooks
+        self.model.eval()
+        ln_modules = collect_norm_modules(self.model)
         stats = {name: {"sum": None, "sq_sum": None, "count": 0}
                  for name, _ in ln_modules}
         hooks = []
@@ -100,7 +131,6 @@ class NormAdapt:
             h = module.register_forward_hook(make_hook(name))
             hooks.append(h)
 
-        # Forward pass through target data
         with torch.no_grad():
             for i, batch in enumerate(tqdm(loader, desc="NormAdapt: collecting stats")):
                 if num_batches is not None and i >= num_batches:
@@ -108,25 +138,19 @@ class NormAdapt:
                 images = batch["image"].to(device)
                 self.model(pixel_values=images)
 
-        # Remove hooks
         for h in hooks:
             h.remove()
 
-        # Update LayerNorm parameters based on collected stats
+        # Adjust affine params: re-center based on target domain statistics
         for name, module in ln_modules:
             s = stats[name]
             if s["count"] == 0:
                 continue
             mean = s["sum"] / s["count"]
             var = s["sq_sum"] / s["count"] - mean ** 2
-            # Adjust affine: new_weight = old_weight * old_std / new_std
-            # new_bias = old_bias + old_weight * (old_mean - new_mean) / new_std
-            # This is approximate; the key effect is re-centering
             std = (var + module.eps).sqrt()
             if module.weight is not None:
-                module.bias.data += module.weight.data * (
-                    -mean / std
-                )
+                module.bias.data += module.weight.data * (-mean / std)
 
         print(f"NormAdapt: updated {len(ln_modules)} LayerNorm modules "
               f"using {stats[ln_modules[0][0]]['count']} tokens")
@@ -156,10 +180,15 @@ class TENT:
         self.original_state = None
 
     def _get_ln_params(self):
-        """Get only LayerNorm affine parameters for optimization."""
+        """Get normalization layer affine parameters for optimization.
+
+        Returns LayerNorm weight/bias for DINOv3, or BatchNorm2d weight/bias for HRNet.
+        """
+        backbone_type = getattr(self.model, "backbone_type", "dinov3")
+        norm_cls = nn.BatchNorm2d if backbone_type in ("hrnet", "hrnet_w32") else nn.LayerNorm
         params = []
         for name, module in self.model.backbone.named_modules():
-            if isinstance(module, nn.LayerNorm):
+            if isinstance(module, norm_cls):
                 if module.weight is not None:
                     params.append(module.weight)
                 if module.bias is not None:
@@ -290,12 +319,14 @@ class MEMO:
         """
         self.original_state = copy.deepcopy(self.model.state_dict())
 
-        # Setup: only update LayerNorm params
+        # Setup: only update normalization layer affine params
+        backbone_type = getattr(self.model, "backbone_type", "dinov3")
+        norm_cls = nn.BatchNorm2d if backbone_type in ("hrnet", "hrnet_w32") else nn.LayerNorm
         for param in self.model.parameters():
             param.requires_grad = False
         ln_params = []
         for module in self.model.backbone.modules():
-            if isinstance(module, nn.LayerNorm):
+            if isinstance(module, norm_cls):
                 if module.weight is not None:
                     module.weight.requires_grad = True
                     ln_params.append(module.weight)

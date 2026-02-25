@@ -5,6 +5,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
 
+from .hrnet_backbone import (
+    build_hrnet_w48,
+    freeze_hrnet,
+    unfreeze_hrnet,
+    hrnet_forward,
+    HRNET_W48_OUT_CHANNELS,
+)
+from .hrnet_head import HRNetKeypointHead
+from .hrnet_w32_backbone import (
+    build_hrnet_w32,
+    freeze_hrnet_w32,
+    unfreeze_hrnet_w32,
+    hrnet_w32_forward,
+    HRNET_W32_OUT_CHANNELS,
+)
+from .hrnet_w32_head import HRNetW32KeypointHead
+
 
 class KeypointHead(nn.Module):
     """MLP head that maps backbone features to keypoint coordinates."""
@@ -327,6 +344,8 @@ class SatellitePoseModel(nn.Module):
         pnp_iterations: int = 10,
         keypoint_head_type: str = "mlp",
         heatmap_size: int = 64,
+        backbone_type: str = "dinov3",
+        hrnet_pretrained: str | None = None,
     ):
         super().__init__()
 
@@ -336,24 +355,59 @@ class SatellitePoseModel(nn.Module):
         self.mode = mode
         self.num_keypoints = num_keypoints
         self.keypoint_head_type = keypoint_head_type
+        self.backbone_type = backbone_type
 
-        # Load pretrained DINOv3 backbone
-        self.backbone = AutoModel.from_pretrained(backbone_name)
-        hidden_size = self.backbone.config.hidden_size  # 1024 for ViT-L
+        if backbone_type == "hrnet_w32":
+            # HRNet-W32 backbone via timm (colleague's architecture)
+            self.backbone = build_hrnet_w32(hrnet_pretrained)
+            hidden_size = HRNET_W32_OUT_CHANNELS  # 128
 
-        if freeze_backbone:
-            self.freeze_backbone(unfreeze_last_n=unfreeze_last_n_blocks)
+            if freeze_backbone:
+                freeze_hrnet_w32(self.backbone, unfreeze_last_n_stages=unfreeze_last_n_blocks)
+        elif backbone_type == "hrnet":
+            # HRNet-W48 backbone via timm
+            self.backbone = build_hrnet_w48(hrnet_pretrained)
+            hidden_size = HRNET_W48_OUT_CHANNELS  # 48
+
+            if freeze_backbone:
+                freeze_hrnet(self.backbone, unfreeze_last_n_stages=unfreeze_last_n_blocks)
+        else:
+            # DINOv3 (default) backbone via HuggingFace
+            self.backbone = AutoModel.from_pretrained(backbone_name)
+            hidden_size = self.backbone.config.hidden_size  # 1024 for ViT-L
+
+            if freeze_backbone:
+                self.freeze_backbone(unfreeze_last_n=unfreeze_last_n_blocks)
 
         # Keypoint head (always present)
         if keypoint_head_type == "heatmap":
-            patch_grid = self.backbone.config.image_size // self.backbone.config.patch_size
-            self.keypoint_head = HeatmapKeypointHead(
-                in_dim=hidden_size,
-                num_keypoints=num_keypoints,
-                heatmap_size=heatmap_size,
-                patch_grid_size=patch_grid,
-            )
+            if backbone_type == "hrnet_w32":
+                self.keypoint_head = HRNetW32KeypointHead(
+                    in_channels=hidden_size,
+                    num_keypoints=num_keypoints,
+                    heatmap_size=heatmap_size,
+                )
+            elif backbone_type == "hrnet":
+                self.keypoint_head = HRNetKeypointHead(
+                    in_channels=hidden_size,
+                    num_keypoints=num_keypoints,
+                    heatmap_size=heatmap_size,
+                )
+            else:
+                patch_grid = self.backbone.config.image_size // self.backbone.config.patch_size
+                self.keypoint_head = HeatmapKeypointHead(
+                    in_dim=hidden_size,
+                    num_keypoints=num_keypoints,
+                    heatmap_size=heatmap_size,
+                    patch_grid_size=patch_grid,
+                )
         else:
+            if backbone_type == "hrnet":
+                # Global average pool + flatten before MLP
+                self.backbone_pool = nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Flatten(),
+                )
             self.keypoint_head = KeypointHead(
                 in_dim=hidden_size,
                 hidden_dims=head_hidden_dims,
@@ -382,13 +436,22 @@ class SatellitePoseModel(nn.Module):
             )
 
     def freeze_backbone(self, unfreeze_last_n: int = 0):
-        """Freeze backbone parameters, optionally unfreezing the last N transformer blocks.
+        """Freeze backbone parameters, optionally unfreezing the last N blocks/stages.
+
+        For DINOv3: unfreezes the last N transformer blocks + final LayerNorm.
+        For HRNet: use freeze_hrnet() directly (called in __init__).
 
         Args:
-            unfreeze_last_n: Number of final transformer blocks to keep trainable.
-                             Also unfreezes the final LayerNorm. 0 = fully frozen.
+            unfreeze_last_n: Number of final blocks to keep trainable. 0 = fully frozen.
         """
-        # Freeze everything first
+        if self.backbone_type == "hrnet_w32":
+            freeze_hrnet_w32(self.backbone, unfreeze_last_n_stages=unfreeze_last_n)
+            return
+        if self.backbone_type == "hrnet":
+            freeze_hrnet(self.backbone, unfreeze_last_n_stages=unfreeze_last_n)
+            return
+
+        # DINOv3 path
         for param in self.backbone.parameters():
             param.requires_grad = False
 
@@ -404,8 +467,13 @@ class SatellitePoseModel(nn.Module):
                 param.requires_grad = True
 
     def unfreeze_backbone(self):
-        for param in self.backbone.parameters():
-            param.requires_grad = True
+        if self.backbone_type == "hrnet_w32":
+            unfreeze_hrnet_w32(self.backbone)
+        elif self.backbone_type == "hrnet":
+            unfreeze_hrnet(self.backbone)
+        else:
+            for param in self.backbone.parameters():
+                param.requires_grad = True
 
     def forward(
         self,
@@ -424,22 +492,45 @@ class SatellitePoseModel(nn.Module):
         Returns:
             dict with available outputs depending on mode
         """
-        outputs = self.backbone(pixel_values=pixel_values)
-
         result = {}
 
-        # Keypoints (always)
-        if self.keypoint_head_type == "heatmap":
-            # DINOv2/v3 layout: [CLS, reg1, ..., regN, patch_1, ..., patch_196]
-            # Skip CLS + register tokens to get only the patch tokens
-            num_patches = self.keypoint_head.patch_grid_size ** 2  # 196
-            patch_tokens = outputs.last_hidden_state[:, -num_patches:]  # (B, 196, hidden_size)
-            kp_out = self.keypoint_head(patch_tokens)
-            result["keypoints"] = kp_out["keypoints"]
-            result["heatmaps"] = kp_out["heatmaps"]
+        if self.backbone_type == "hrnet_w32":
+            # HRNet-W32 path: returns (B, 128, H/4, W/4) spatial feature map
+            feat_map = hrnet_w32_forward(self.backbone, pixel_values)
+
+            if self.keypoint_head_type == "heatmap":
+                kp_out = self.keypoint_head(feat_map)
+                result["keypoints"] = kp_out["keypoints"]
+                result["heatmaps"] = kp_out["heatmaps"]
+            else:
+                pooled = self.backbone_pool(feat_map)
+                result["keypoints"] = self.keypoint_head(pooled)
+        elif self.backbone_type == "hrnet":
+            # HRNet-W48 path: returns (B, 48, H/4, W/4) spatial feature map
+            feat_map = hrnet_forward(self.backbone, pixel_values)
+
+            if self.keypoint_head_type == "heatmap":
+                kp_out = self.keypoint_head(feat_map)
+                result["keypoints"] = kp_out["keypoints"]
+                result["heatmaps"] = kp_out["heatmaps"]
+            else:
+                pooled = self.backbone_pool(feat_map)  # (B, 48)
+                result["keypoints"] = self.keypoint_head(pooled)
         else:
-            cls_token = outputs.pooler_output  # (B, hidden_size)
-            result["keypoints"] = self.keypoint_head(cls_token)
+            # DINOv3 path (unchanged)
+            outputs = self.backbone(pixel_values=pixel_values)
+
+            if self.keypoint_head_type == "heatmap":
+                # DINOv2/v3 layout: [CLS, reg1, ..., regN, patch_1, ..., patch_196]
+                # Skip CLS + register tokens to get only the patch tokens
+                num_patches = self.keypoint_head.patch_grid_size ** 2  # 196
+                patch_tokens = outputs.last_hidden_state[:, -num_patches:]  # (B, 196, hidden_size)
+                kp_out = self.keypoint_head(patch_tokens)
+                result["keypoints"] = kp_out["keypoints"]
+                result["heatmaps"] = kp_out["heatmaps"]
+            else:
+                cls_token = outputs.pooler_output  # (B, hidden_size)
+                result["keypoints"] = self.keypoint_head(cls_token)
 
         # Differentiable PnP
         if self.diff_pnp is not None and crop_box is not None:

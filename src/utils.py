@@ -30,6 +30,30 @@ def load_pnp_data(points_3d_path: str, camera_json_path: str) -> dict:
     }
 
 
+def compute_crop_K(K_full: np.ndarray, crop_box: np.ndarray, image_size: int) -> np.ndarray:
+    """Adjust camera intrinsics from full image space to crop-resized space.
+
+    Args:
+        K_full: (3, 3) camera matrix for the full image
+        crop_box: (4,) crop box [x1, y1, x2, y2] in full image pixels
+        image_size: target size the crop is resized to (e.g. 512)
+
+    Returns:
+        (3, 3) adjusted camera matrix for the crop-resized space
+    """
+    x1, y1, x2, y2 = crop_box
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    sx = image_size / crop_w
+    sy = image_size / crop_h
+    K_crop = K_full.copy()
+    K_crop[0, 0] *= sx
+    K_crop[1, 1] *= sy
+    K_crop[0, 2] = (K_full[0, 2] - x1) * sx
+    K_crop[1, 2] = (K_full[1, 2] - y1) * sy
+    return K_crop
+
+
 def solve_pnp_batch(
     pred_kp: torch.Tensor,
     crop_box: torch.Tensor,

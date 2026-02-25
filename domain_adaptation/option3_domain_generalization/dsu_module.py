@@ -33,7 +33,11 @@ class DSU(nn.Module):
             return x
 
         # Compute instance-level statistics
-        if x.dim() == 3:
+        if x.dim() == 4:
+            # (B, C, H, W) — CNN feature map (e.g. HRNet)
+            mu = x.mean(dim=(2, 3), keepdim=True)    # (B, C, 1, 1)
+            sigma = x.std(dim=(2, 3), keepdim=True) + 1e-6  # (B, C, 1, 1)
+        elif x.dim() == 3:
             # (B, N, D) — ViT sequence of tokens
             mu = x.mean(dim=1, keepdim=True)    # (B, 1, D)
             sigma = x.std(dim=1, keepdim=True) + 1e-6   # (B, 1, D)

@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, Dataset
 from tqdm import tqdm
 
 # Add project root to path
@@ -41,6 +41,20 @@ from evaluate_robust import (
 )
 
 from domain_adaptation.option2_self_training.pseudo_label_dataset import PseudoLabelDataset
+
+
+class AddPseudoKeys(Dataset):
+    """Wraps a dataset to add pseudo_weight and confidence keys for collate compatibility."""
+    def __init__(self, dataset, num_keypoints):
+        self.dataset = dataset
+        self.num_keypoints = num_keypoints
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        sample["pseudo_weight"] = torch.tensor(1.0, dtype=torch.float32)
+        sample["confidence"] = torch.ones(self.num_keypoints, dtype=torch.float32)
+        return sample
 
 
 def load_split_list(splits_dir, domain, split_type):
@@ -68,6 +82,8 @@ def build_model(config):
         pnp_iterations=geo_cfg.get("pnp_iterations", 10),
         keypoint_head_type=config["model"].get("keypoint_head_type", "mlp"),
         heatmap_size=pose_cfg.get("heatmap_size", 64),
+        backbone_type=config["model"].get("backbone_type", "dinov3"),
+        hrnet_pretrained=config["model"].get("hrnet_pretrained", None),
     )
 
 
@@ -143,12 +159,23 @@ def generate_pseudo_labels(model, dataset, device, batch_size=32, num_workers=2)
 @torch.no_grad()
 def evaluate_on_test(model, config, domain, test_list, device, pnp_data,
                      batch_size=32, min_landmarks=8, reproj_error=15.0,
-                     confidence_threshold=0.95):
+                     confidence_threshold=0.95, no_crop=False, gt_crop=False,
+                     resize_first=False, crop_pnp=False,
+                     ransac_iterations=200, ransac_confidence=0.99,
+                     min_kpt_area=0.0, t_ratio_max=0.0,
+                     kpt_extractor="softargmax", rmse_inliers_thr=0.0,
+                     no_conf_filter=False, min_inliers_schedule=None,
+                     refine_lm=True, refine_retrim=True,
+                     refine_keep_frac=0.8, refine_min_keep=6):
     """Robust evaluation on test split using adaptive confidence + top-N fallback."""
     root = Path(config["data"]["root"])
     split_cfg = config["data"]["splits"][domain]
-    transform = KeypointTransform(image_size=config["data"]["image_size"], is_train=False)
+    transform = KeypointTransform(
+        image_size=config["data"]["image_size"], is_train=False,
+        imagenet_normalize=config["data"].get("imagenet_normalize", True),
+    )
     mode = config["model"]["mode"]
+    pose_cfg = config.get("pose", {})
 
     pose_json = config["data"].get("pose_labels", {}).get(domain)
 
@@ -160,6 +187,9 @@ def evaluate_on_test(model, config, domain, test_list, device, pnp_data,
         transform=transform,
         pose_json=pose_json,
         include_list=test_list,
+        no_crop=no_crop,
+        gt_crop=gt_crop,
+        resize_first=config["data"]["image_size"] if resize_first else 0,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
@@ -168,6 +198,22 @@ def evaluate_on_test(model, config, domain, test_list, device, pnp_data,
         min_landmarks=min_landmarks,
         reproj_error=reproj_error,
         confidence_threshold=confidence_threshold,
+        crop_pnp=crop_pnp,
+        image_size=config["data"]["image_size"],
+        ransac_iterations=ransac_iterations,
+        ransac_confidence=ransac_confidence,
+        min_kpt_area=min_kpt_area,
+        t_ratio_max=t_ratio_max,
+        resize_first=resize_first,
+        heatmap_size=pose_cfg.get("heatmap_size", 128),
+        kpt_extractor=kpt_extractor,
+        rmse_inliers_thr=rmse_inliers_thr,
+        no_conf_filter=no_conf_filter,
+        min_inliers_schedule=min_inliers_schedule,
+        refine_lm=refine_lm,
+        refine_retrim=refine_retrim,
+        refine_keep_frac=refine_keep_frac,
+        refine_min_keep=refine_min_keep,
     )
 
     n_total = len(pnp_results)
@@ -193,7 +239,50 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Override output directory from config")
     parser.add_argument("--subset_size", type=int, default=None)
+
+    # Evaluation parameters (matching evaluate_robust.py)
+    parser.add_argument("--no_crop", action="store_true",
+                        help="Feed full images (no YOLO bbox crop)")
+    parser.add_argument("--gt_crop", action="store_true",
+                        help="Crop around GT keypoints instead of YOLO bbox")
+    parser.add_argument("--crop_pnp", action="store_true",
+                        help="Run PnP in crop-resized space with adjusted K")
+    parser.add_argument("--resize_first", action="store_true",
+                        help="Resize full image to image_size before cropping")
+    parser.add_argument("--kpt_extractor", type=str, default="softargmax",
+                        choices=["softargmax", "argmax"],
+                        help="Keypoint extraction method")
+    parser.add_argument("--reproj_error", type=float, default=15.0,
+                        help="RANSAC reprojection error in pixels")
+    parser.add_argument("--ransac_confidence", type=float, default=0.99,
+                        help="RANSAC confidence parameter")
+    parser.add_argument("--ransac_iterations", type=int, default=200,
+                        help="RANSAC max iterations")
+    parser.add_argument("--t_ratio_max", type=float, default=0.0,
+                        help="Max ||t_est||/||t_gt|| ratio to accept (0=disabled)")
+    parser.add_argument("--min_kpt_area", type=float, default=0.0,
+                        help="Min bbox area of visible keypoints to accept PnP (0=disabled)")
+    parser.add_argument("--rmse_inliers_thr", type=float, default=0.0,
+                        help="Reject PnP solutions with inlier RMSE > threshold (0=disabled)")
+    parser.add_argument("--no_conf_filter", action="store_true",
+                        help="Skip confidence pre-filtering; feed all visible to RANSAC")
+    parser.add_argument("--min_inliers_schedule", type=str, default="",
+                        help="Comma-separated descending min inlier thresholds")
+    parser.add_argument("--refine_lm", type=int, default=0,
+                        help="Enable LM refinement after EPnP (default: 0)")
+    parser.add_argument("--refine_retrim", type=int, default=0,
+                        help="Enable 2-pass LM with outlier retrimming (default: 0)")
     args = parser.parse_args()
+
+    # Parse cascading schedule
+    schedule_str = (args.min_inliers_schedule or "").strip()
+    if schedule_str:
+        args.min_inliers_schedule_list = sorted(
+            [int(x.strip()) for x in schedule_str.split(",") if x.strip()],
+            reverse=True,
+        )
+    else:
+        args.min_inliers_schedule_list = None
 
     # Load configs
     with open(args.config) as f:
@@ -254,11 +343,13 @@ def main():
 
     # Evaluation transform (no augmentation)
     eval_transform = KeypointTransform(
-        image_size=config["data"]["image_size"], is_train=False
+        image_size=config["data"]["image_size"], is_train=False,
+        imagenet_normalize=config["data"].get("imagenet_normalize", True),
     )
     # Training transform (with augmentation) for pseudo-labeled data
     train_transform = KeypointTransform(
         image_size=config["data"]["image_size"], is_train=True,
+        imagenet_normalize=config["data"].get("imagenet_normalize", True),
         color_jitter=config.get("augmentation", {}).get("color_jitter", 0.3),
     )
 
@@ -286,6 +377,9 @@ def main():
                 bbox_pad_ratio=config["data"].get("bbox_pad_ratio", 0.1),
                 transform=eval_transform,
                 include_list=style_lists[domain],
+                no_crop=args.no_crop,
+                gt_crop=args.gt_crop,
+                resize_first=config["data"]["image_size"] if args.resize_first else 0,
             )
 
             pseudo_labels = generate_pseudo_labels(
@@ -317,7 +411,8 @@ def main():
         # Step 2: Build mixed training set
         if all_pseudo_datasets:
             pseudo_combined = ConcatDataset(all_pseudo_datasets)
-            mixed_dataset = ConcatDataset([train_dataset, pseudo_combined])
+            wrapped_train = AddPseudoKeys(train_dataset, config["data"]["num_keypoints"])
+            mixed_dataset = ConcatDataset([wrapped_train, pseudo_combined])
             print(f"\n  Mixed dataset: {len(train_dataset)} synthetic + "
                   f"{len(pseudo_combined)} pseudo = {len(mixed_dataset)} total")
         else:
@@ -346,6 +441,9 @@ def main():
                 transform=eval_transform,
                 pose_json=config["data"].get("pose_labels", {}).get(domain),
                 include_list=test_lists[domain],
+                no_crop=args.no_crop,
+                gt_crop=args.gt_crop,
+                resize_first=config["data"]["image_size"] if args.resize_first else 0,
             )
             eval_loaders[domain] = DataLoader(
                 test_ds, batch_size=batch_size, shuffle=False,
@@ -373,6 +471,19 @@ def main():
         for domain in target_domains:
             metrics = evaluate_on_test(
                 model, config, domain, test_lists[domain], device, pnp_data,
+                no_crop=args.no_crop, gt_crop=args.gt_crop,
+                resize_first=args.resize_first, crop_pnp=args.crop_pnp,
+                ransac_iterations=args.ransac_iterations,
+                ransac_confidence=args.ransac_confidence,
+                min_kpt_area=args.min_kpt_area,
+                t_ratio_max=args.t_ratio_max,
+                kpt_extractor=args.kpt_extractor,
+                rmse_inliers_thr=args.rmse_inliers_thr,
+                no_conf_filter=args.no_conf_filter,
+                min_inliers_schedule=args.min_inliers_schedule_list,
+                refine_lm=bool(args.refine_lm),
+                refine_retrim=bool(args.refine_retrim),
+                reproj_error=args.reproj_error,
             )
             print(f"    {domain}: px_err={metrics.get('px_err', 0):.2f}  "
                   f"pck={metrics.get('pck', 0):.4f}  "

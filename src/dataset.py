@@ -31,12 +31,22 @@ class SpeedPlusKeypointDataset(Dataset):
         fda_pool=None,
         fda_prob: float = 0.0,
         bg_labels: dict[str, str] | None = None,
+        no_crop: bool = False,
+        gt_crop: bool = False,
+        gt_crop_margin: float = 0.15,
+        gt_crop_min_size: float = 64.0,
+        resize_first: int = 0,
     ):
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
         self.num_keypoints = num_keypoints
         self.bbox_pad_ratio = bbox_pad_ratio
         self.transform = transform
+        self.no_crop = no_crop
+        self.gt_crop = gt_crop
+        self.gt_crop_margin = gt_crop_margin
+        self.gt_crop_min_size = gt_crop_min_size
+        self.resize_first = resize_first
 
         # FDA augmentation (optional)
         self.fda_pool = fda_pool
@@ -164,18 +174,54 @@ class SpeedPlusKeypointDataset(Dataset):
 
         # Load image (grayscale -> convert to RGB for DINOv3)
         image = Image.open(img_path)
-        img_w, img_h = image.size
+        orig_w, orig_h = image.size
         if image.mode == "L":
             image = image.convert("RGB")
+
+        # Optionally resize to target size before cropping
+        # (matching colleague's pipeline: resize 1920x1200 → 512x512, then crop)
+        if self.resize_first > 0:
+            image = image.resize(
+                (self.resize_first, self.resize_first), Image.BILINEAR)
+
+        img_w, img_h = image.size  # working dimensions (may be resized)
 
         # Parse label
         bbox, keypoints, visibility = self._parse_label(label_path)
 
-        # Crop to bbox
-        crop, crop_box = self._crop_bbox(image, bbox)
-
-        # Remap keypoints to crop-relative coordinates
-        kp_crop = self._remap_keypoints(keypoints, crop_box, img_w, img_h)
+        # Crop to bbox (or use full image for models trained on full images)
+        if self.no_crop:
+            crop = image
+            crop_box = np.array([0, 0, img_w, img_h], dtype=np.float32)
+            kp_crop = keypoints  # already [0,1] in full-image space
+        elif self.gt_crop:
+            # Crop around GT keypoints (matching colleague's pipeline)
+            kp_px = keypoints.copy()
+            kp_px[:, 0] *= img_w
+            kp_px[:, 1] *= img_h
+            valid = visibility > 0
+            if valid.sum() >= 2:
+                xs, ys = kp_px[valid, 0], kp_px[valid, 1]
+                cx = (xs.min() + xs.max()) / 2
+                cy = (ys.min() + ys.max()) / 2
+                bw = max(float(xs.max() - xs.min()), 1.0) * (1 + self.gt_crop_margin)
+                bh = max(float(ys.max() - ys.min()), 1.0) * (1 + self.gt_crop_margin)
+                side = max(bw, bh, self.gt_crop_min_size)
+                x1 = max(0, int(cx - side / 2))
+                y1 = max(0, int(cy - side / 2))
+                x2 = min(img_w, int(cx + side / 2))
+                y2 = min(img_h, int(cy + side / 2))
+                crop = image.crop((x1, y1, x2, y2))
+                crop_box = np.array([x1, y1, x2, y2], dtype=np.float32)
+                kp_crop = self._remap_keypoints(keypoints, crop_box, img_w, img_h)
+            else:
+                # Fallback to full image if too few visible keypoints
+                crop = image
+                crop_box = np.array([0, 0, img_w, img_h], dtype=np.float32)
+                kp_crop = keypoints
+        else:
+            crop, crop_box = self._crop_bbox(image, bbox)
+            kp_crop = self._remap_keypoints(keypoints, crop_box, img_w, img_h)
 
         # FDA style transfer (before other augmentations)
         if self.fda_pool is not None and random.random() < self.fda_prob:
@@ -191,7 +237,7 @@ class SpeedPlusKeypointDataset(Dataset):
             "keypoints": torch.as_tensor(kp_crop, dtype=torch.float32),
             "visibility": torch.as_tensor(visibility, dtype=torch.long),
             "crop_box": torch.as_tensor(crop_box, dtype=torch.float32),
-            "img_size": torch.tensor([img_w, img_h], dtype=torch.float32),
+            "img_size": torch.tensor([orig_w, orig_h], dtype=torch.float32),
         }
 
         # Add pose labels if available
@@ -206,5 +252,6 @@ class SpeedPlusKeypointDataset(Dataset):
             sample["translation"] = torch.zeros(3, dtype=torch.float32)
 
         sample["has_pose"] = torch.tensor(filename in self.pose_data, dtype=torch.bool)
+        sample["filename"] = filename
 
         return sample

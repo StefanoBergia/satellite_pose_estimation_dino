@@ -1,8 +1,9 @@
 data:
   root: /nfs/home/caracciolo/dataset/speedplus_yolo
   num_keypoints: 11
-  image_size: 224
+  image_size: 512
   bbox_pad_ratio: 0.1
+  imagenet_normalize: false
   splits:
     train:
       images: images/train
@@ -24,15 +25,14 @@ data:
     sunlamp: /nfs/home/caracciolo/dataset/speedplusv2/sunlamp/test.json
 
 model:
-  backbone: facebook/dinov3-vitl16-pretrain-lvd1689m
+  backbone: hrnet_w32
+  backbone_type: "hrnet_w32"
+  hrnet_pretrained: null
   freeze_backbone: true
-  # Number of final ViT blocks to unfreeze (0 = fully frozen, 4-6 recommended)
   unfreeze_last_n_blocks: 4
   head_hidden: [512, 256]
   dropout: 0.1
-  # Mode: "keypoint_only" | "keypoint_pnp"
   mode: "keypoint_only"
-  # Keypoint head type: "mlp" (direct regression from CLS token) | "heatmap" (deconv + soft-argmax)
   keypoint_head_type: "heatmap"
 
 # 3D model and camera (needed for keypoint_pnp mode)
@@ -43,60 +43,52 @@ geometry:
 
 train:
   epochs: 50
-  batch_size: 64
+  batch_size: 8
   lr: 1.0e-3
   lr_backbone: 1.0e-5
   weight_decay: 1.0e-4
   occluded_weight: 0.5
   num_workers: 2
-  output_dir: ./outputs_dino_msssim
+  output_dir: ./outputs_hrnet_w32_msssim
   log_interval: 50
 
 augmentation:
-  # Photometric only — no spatial augmentations (flip/rotation/scale removed
-  # because they require careful keypoint remapping and the Tango has
-  # asymmetric keypoints)
   color_jitter: 0.5
   gaussian_blur_prob: 0.3
   gaussian_blur_kernel: [3, 7]
   gaussian_noise_prob: 0.3
   gaussian_noise_std: 0.02
   random_erasing_prob: 0.2
-  # Space lighting augmentations (sim-to-real domain gap)
   sun_flare_prob: 0.3
   sun_flare_intensity: [0.3, 1.0]
   brightness_gradient_prob: 0.3
   brightness_gradient_strength: [0.2, 0.6]
   random_gamma_prob: 0.3
   random_gamma_range: [0.5, 2.0]
-  # Sim-to-real domain gap augmentations
   motion_blur_prob: 0.2
   motion_blur_kernel: [5, 15]
   clahe_prob: 0.3
   clahe_clip_limit: [1.0, 4.0]
   channel_dropout_prob: 0.2
-  # FDA (Fourier Domain Adaptation) — sim-to-real style transfer
-  # Swaps low-freq amplitude spectrum of synthetic images with real-domain images.
-  # Requires running: python scripts/prepare_fda_splits.py
-  fda_prob: 0.0              # 0.0 = disabled, 0.3-0.5 recommended
-  fda_beta: 0.05             # low-freq bandwidth (fraction of spectrum)
-  fda_lambda: 0.5            # blending strength (0=no change, 1=full target)
+  fda_prob: 0.0
+  fda_beta: 0.05
+  fda_lambda: 0.5
   fda_target_domains:
     - lightbox
     - sunlamp
 
 # FDA split configuration
 fda:
-  splits_dir: data/splits    # directory with style/test split lists
-  style_fraction: 0.2        # fraction of real images for style pool
-  var_threshold: 0.003       # background classification threshold
+  splits_dir: data/splits
+  style_fraction: 0.2
+  var_threshold: 0.003
 
-# Loss weights for pose modes
+# Loss weights
 pose:
   lambda_keypoint: 1.0
   lambda_heatmap: 4.0
-  heatmap_size: 64
-  heatmap_sigma: 1.5
+  heatmap_size: 128
+  heatmap_sigma: 2.0
   lambda_pnp_pose: 0.5
   rotation_weight: 1.0
   translation_weight: 1.0
@@ -105,9 +97,8 @@ pose:
   msssim_warmup_epochs: 5
   msssim_rampup_epochs: 10
   msssim_win_size: 7
-  msssim_num_scales: 3
-  # PnP warmup: skip PnP loss for first N epochs, then ramp up over M epochs
-  pnp_warmup_epochs: 0 #without pretrain
+  msssim_num_scales: 4
+  pnp_warmup_epochs: 0
   pnp_rampup_epochs: 0
 
 eval:

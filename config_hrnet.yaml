@@ -24,15 +24,22 @@ data:
     sunlamp: /nfs/home/caracciolo/dataset/speedplusv2/sunlamp/test.json
 
 model:
-  backbone: facebook/dinov3-vitl16-pretrain-lvd1689m
+  backbone: hrnet_w48           # informational label (not a HuggingFace ID)
+  backbone_type: "hrnet"        # switch: "dinov3" | "hrnet"
+  # Optional: path to mmpose HRNet-W48 COCO checkpoint for initialization.
+  # Download from:
+  #   https://download.openmmlab.com/mmpose/top_down/hrnet/hrnet_w48_coco_256x192-b9e0b3ab_20200708.pth
+  # Set to null to use timm's default ImageNet pretrained weights instead.
+  hrnet_pretrained: null
   freeze_backbone: true
-  # Number of final ViT blocks to unfreeze (0 = fully frozen, 4-6 recommended)
+  # For HRNet: number of final stages to unfreeze (HRNet has 4 stages total).
+  # 4 = fully unfreeze all stages + stem (~28M params, much smaller than DINOv3 307M).
   unfreeze_last_n_blocks: 4
-  head_hidden: [512, 256]
+  head_hidden: [512, 256]       # used only for MLP head; ignored for heatmap head
   dropout: 0.1
   # Mode: "keypoint_only" | "keypoint_pnp"
   mode: "keypoint_only"
-  # Keypoint head type: "mlp" (direct regression from CLS token) | "heatmap" (deconv + soft-argmax)
+  # Keypoint head type: "heatmap" recommended for HRNet (simplified 1x1 conv head)
   keypoint_head_type: "heatmap"
 
 # 3D model and camera (needed for keypoint_pnp mode)
@@ -49,20 +56,18 @@ train:
   weight_decay: 1.0e-4
   occluded_weight: 0.5
   num_workers: 2
-  output_dir: ./outputs_dino_msssim
+  output_dir: ./outputs_hrnet_heatmap
   log_interval: 50
 
 augmentation:
-  # Photometric only — no spatial augmentations (flip/rotation/scale removed
-  # because they require careful keypoint remapping and the Tango has
-  # asymmetric keypoints)
+  # Photometric only — no spatial augmentations
   color_jitter: 0.5
   gaussian_blur_prob: 0.3
   gaussian_blur_kernel: [3, 7]
   gaussian_noise_prob: 0.3
   gaussian_noise_std: 0.02
   random_erasing_prob: 0.2
-  # Space lighting augmentations (sim-to-real domain gap)
+  # Space lighting augmentations
   sun_flare_prob: 0.3
   sun_flare_intensity: [0.3, 1.0]
   brightness_gradient_prob: 0.3
@@ -75,39 +80,32 @@ augmentation:
   clahe_prob: 0.3
   clahe_clip_limit: [1.0, 4.0]
   channel_dropout_prob: 0.2
-  # FDA (Fourier Domain Adaptation) — sim-to-real style transfer
-  # Swaps low-freq amplitude spectrum of synthetic images with real-domain images.
-  # Requires running: python scripts/prepare_fda_splits.py
-  fda_prob: 0.0              # 0.0 = disabled, 0.3-0.5 recommended
-  fda_beta: 0.05             # low-freq bandwidth (fraction of spectrum)
-  fda_lambda: 0.5            # blending strength (0=no change, 1=full target)
+  # FDA disabled by default (can be enabled; same pipeline as DINOv3)
+  fda_prob: 0.0
+  fda_beta: 0.05
+  fda_lambda: 0.5
   fda_target_domains:
     - lightbox
     - sunlamp
 
 # FDA split configuration
 fda:
-  splits_dir: data/splits    # directory with style/test split lists
-  style_fraction: 0.2        # fraction of real images for style pool
-  var_threshold: 0.003       # background classification threshold
+  splits_dir: data/splits
+  style_fraction: 0.2
+  var_threshold: 0.003
 
-# Loss weights for pose modes
+# Loss weights
 pose:
   lambda_keypoint: 1.0
   lambda_heatmap: 4.0
-  heatmap_size: 64
-  heatmap_sigma: 1.5
+  # HRNet outputs at image_size/4 = 224/4 = 56 natively
+  heatmap_size: 56
+  # Slightly larger sigma for 56px heatmaps (vs 64px for DINOv3)
+  heatmap_sigma: 2.0
   lambda_pnp_pose: 0.5
   rotation_weight: 1.0
   translation_weight: 1.0
-  # MS-SSIM heatmap loss (structural similarity for Gaussian peak supervision)
-  lambda_msssim: 1.0
-  msssim_warmup_epochs: 5
-  msssim_rampup_epochs: 10
-  msssim_win_size: 7
-  msssim_num_scales: 3
-  # PnP warmup: skip PnP loss for first N epochs, then ramp up over M epochs
-  pnp_warmup_epochs: 0 #without pretrain
+  pnp_warmup_epochs: 0
   pnp_rampup_epochs: 0
 
 eval:

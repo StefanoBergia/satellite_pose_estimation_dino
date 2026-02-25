@@ -1,9 +1,12 @@
 torch>=2.1
 torchvision>=0.16
 transformers>=4.56
+timm>=0.9
 opencv-python>=4.8
 Pillow
 pyyaml
 tensorboard
 tqdm
 matplotlib>=3.7
+numpy>=1.24
+onnx>=1.14
