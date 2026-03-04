@@ -24,7 +24,7 @@ train:
   lr_backbone: 1.0e-5
   weight_decay: 1.0e-4
   num_workers: 2
-  output_dir: ./outputs_domain_generalization
+  output_dir: ./outputs_domain_generalization_mssim
 
 # Base config to inherit from
 base_config: "config.yaml"

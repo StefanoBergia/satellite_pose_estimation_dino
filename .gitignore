@@ -58,6 +58,15 @@ train_sunlamp_style/
 outputs_dino_msssim/
 outputs_hrnet_heatmap/
 outputs_hrnet_w32/
+outputs_hrnet_w64/
+outputs_dann/
+outputs_domain_generalization_mssim/
+outputs_self_training_dg_mssim/
+outputs_self_training_dg_mssim_epoch_30/
+outputs_self_training_incremental_cumulative/
+outputs_self_training_incremental_cumulative_pass2/
+outputs_self_training_incremental_sequential/
+outputs_self_training_testfull/
 
 # SLURM logs
 slurm/logs/
@@ -69,6 +78,9 @@ events.out.tfevents.*
 # Evaluation / benchmark result files (outputs, not source)
 results_*.txt
 *_results.txt
+
+# Large archives
+jetson_dataset.zip
 
 # Misc
 .source

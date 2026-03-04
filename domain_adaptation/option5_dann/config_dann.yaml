@@ -1,0 +1,31 @@
+# DANN Domain Adaptation configuration (Option 5)
+# Domain Adversarial Neural Network: trains backbone to produce domain-invariant
+# features via Gradient Reversal Layer + 3-class domain classifier.
+#
+# Domains:
+#   0: synthetic (train split, ~47K images)
+#   1: lightbox  (lightbox_style.txt, ~1348 images)
+#   2: sunlamp   (sunlamp_style.txt, ~558 images)
+# All classes undersampled to 558 for balance.
+
+# Base config to inherit model/data settings from
+base_config: "config.yaml"
+
+# DANN-specific hyperparameters
+dann:
+  lambda_max: 0.3              # conservative start; increase to 1.0 if domain loss too low
+  domain_classifier_hidden: 256
+  apply_lambda_schedule: true  # ramp lambda from 0 to lambda_max (DANN schedule)
+  feature_dim: 1024            # DINOv3 ViT-L hidden size (pooler_output dim)
+  splits_dir: "data/splits"    # directory with lightbox_style.txt / sunlamp_style.txt
+  classifier_warmup_epochs: 5  # epochs with lambda=0 to pretrain domain classifier
+
+# Override base config train settings for DANN fine-tuning
+train:
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  num_workers: 2
+  output_dir: ./outputs_dann

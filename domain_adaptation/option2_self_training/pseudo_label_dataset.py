@@ -130,5 +130,6 @@ class PseudoLabelDataset(Dataset):
             "quaternion": torch.zeros(4, dtype=torch.float32),
             "translation": torch.zeros(3, dtype=torch.float32),
             "has_pose": torch.tensor(False, dtype=torch.bool),
+            "filename": s["image_path"].name,
         }
         return sample

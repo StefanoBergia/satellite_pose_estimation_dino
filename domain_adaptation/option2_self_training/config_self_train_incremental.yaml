@@ -1,0 +1,57 @@
+# Self-Training with Pseudo-Labels — INCREMENTAL (curriculum / sequential)
+# Trains on one fresh 20% chunk per step: chunk0 → chunk1 → … → chunk4
+# Curriculum hypothesis: improved model at each step generates better pseudo-labels
+# for the next harder chunk, outperforming the 100%-testfull single-step run.
+#
+# To run cumulative variant (20%→40%→60%→80%→100%), change:
+#   incremental.mode: "cumulative"
+#   train.output_dir: ./outputs_self_training_incremental_cumulative
+
+self_training:
+  # Pretrained checkpoint to generate initial pseudo-labels from
+  pretrained_checkpoint: "outputs_hrnet_w32/converted_model.pth"
+
+  # Confidence filtering: minimum heatmap peak to accept a pseudo-label
+  confidence_threshold: 0.02
+
+  # Loss weight for pseudo-labeled samples (vs 1.0 for GT-labeled)
+  pseudo_label_weight: 0.5
+
+  # Target domains to self-train on
+  target_domains:
+    - sunlamp
+    - lightbox
+
+  # Downsample synthetic training set per iteration.
+  # With ~1078 lightbox + ~448 sunlamp per chunk (~1526 pseudo), 16000 gives ~90% synth
+  # which keeps the anchor strong while incorporating new pseudo-labels.
+  synth_subset_size: 16000
+
+  # num_iterations is overridden by incremental.n_chunks when enabled=true
+  num_iterations: 5
+
+  # Epochs per self-training iteration (5 steps × 10 epochs = 50 total)
+  epochs_per_iteration: 10
+
+  incremental:
+    enabled: true
+    mode: "sequential"    # "sequential" (one fresh chunk) or "cumulative" (growing window)
+    n_chunks: 5
+    chunks_dir: "data/splits_incremental"
+    holdout_chunk: 4      # chunk index held out from adaptation (kept as blind test set)
+
+# Training hyperparams (lower LR for fine-tuning)
+train:
+  epochs: 10              # overridden by epochs_per_iteration
+  batch_size: 8
+  lr: 1.0e-4
+  lr_backbone: 1.0e-6
+  weight_decay: 1.0e-4
+  num_workers: 2
+  output_dir: ./outputs_self_training_incremental_sequential
+
+# Splits directory — test splits for evaluation
+splits_dir: "data/splits_testfull"
+
+# Base config to inherit from
+base_config: "config_keypoint.yaml"

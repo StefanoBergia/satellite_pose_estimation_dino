@@ -7,7 +7,7 @@ metrics. Generates individual comparison images and summary grids per split.
 Usage:
     python visualize_comparison.py \
         --config_a config.yaml \
-        --checkpoint_a outputs_keypoints_heatmap_FDA/best_model.pth \
+        --checkpoint_a outputs_dino_msssim/best_model.pth \
         --config_b config_hrnet_w32.yaml \
         --checkpoint_b outputs_hrnet_w32/converted_model.pth \
         --splits val lightbox sunlamp \

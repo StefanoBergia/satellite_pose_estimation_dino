@@ -95,6 +95,7 @@ class Trainer:
 
         self.writer = SummaryWriter(log_dir=str(self.output_dir / "logs"))
         self.best_val_loss = float("inf")
+        self.save_best_model = config["train"].get("save_best_model", True)
 
     def _get_pnp_weight(self, epoch: int) -> float:
         """Compute PnP loss weight with warmup + linear ramp-up."""
@@ -148,15 +149,20 @@ class Trainer:
                 print(msg)
 
             # Save best model (reuse metrics already computed above)
-            primary_split = "val" if "val" in all_metrics else next(iter(all_metrics))
-            val_metrics = all_metrics[primary_split]
-            if val_metrics["loss"] < self.best_val_loss:
-                self.best_val_loss = val_metrics["loss"]
-                self._save_checkpoint(epoch, is_best=True)
-                print(f"  * New best model (val_loss={self.best_val_loss:.5f})")
+            if self.save_best_model:
+                primary_split = "val" if "val" in all_metrics else next(iter(all_metrics))
+                val_metrics = all_metrics[primary_split]
+                if val_metrics["loss"] < self.best_val_loss:
+                    self.best_val_loss = val_metrics["loss"]
+                    self._save_checkpoint(epoch, is_best=True)
+                    print(f"  * New best model (val_loss={self.best_val_loss:.5f})")
 
             if epoch % 10 == 0:
                 self._save_checkpoint(epoch)
+
+        if not self.save_best_model:
+            self._save_checkpoint(self.epochs, is_best=True)
+            print(f"  * Saved last epoch as best_model.pth (epoch {self.epochs})")
 
         self.writer.close()
         print("Training complete.")

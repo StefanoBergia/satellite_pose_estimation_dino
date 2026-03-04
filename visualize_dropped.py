@@ -1,9 +1,11 @@
 """Visualize images that were dropped (PnP failed) by evaluate_robust.py.
 
-Loads dropped_{split}.txt files, runs inference on those images, and produces
-side-by-side annotated visualizations:
+Side-by-side annotated visualizations:
   LEFT:  crop inference (the run that failed)
-  RIGHT: full-image inference (fallback — satellite always fully in frame)
+  RIGHT: full-image inference (no bbox crop)
+
+All coordinate transforms are done in the main loop before calling draw functions.
+Draw functions receive pre-computed display-space pixel coords.
 
 Usage:
     python visualize_dropped.py --checkpoint outputs_keypoints_heatmap/best_model.pth --splits lightbox sunlamp
@@ -13,6 +15,7 @@ Usage:
 import argparse
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -58,7 +61,7 @@ def parse_dropped_file(path):
 
 
 def confidence_color(conf):
-    """Map confidence [0, 1] to a color: red (low) -> yellow (mid) -> green (high)."""
+    """Map confidence [0,1] to color: red (low) -> yellow (mid) -> green (high)."""
     if conf < 0.5:
         r = 255
         g = int(255 * (conf / 0.5))
@@ -68,8 +71,15 @@ def confidence_color(conf):
     return (r, g, 0)
 
 
-def crop_to_full_keypoints(kp_crop, crop_box):
-    """Convert crop-relative [0,1] keypoints to full-image pixel coords."""
+# ---------------------------------------------------------------------------
+# Coordinate helpers
+# ---------------------------------------------------------------------------
+
+def crop_to_working(kp_crop, crop_box):
+    """Convert crop-relative [0,1] keypoints to working-image pixel coords.
+
+    crop_box: (x1, y1, x2, y2) in working-image pixels
+    """
     x1, y1, x2, y2 = crop_box
     kp_px = np.zeros_like(kp_crop)
     kp_px[:, 0] = kp_crop[:, 0] * (x2 - x1) + x1
@@ -77,88 +87,87 @@ def crop_to_full_keypoints(kp_crop, crop_box):
     return kp_px
 
 
-def infer_fullimage(model, img_path, transform, num_keypoints, device, mode, vis_tensor):
-    """Run model inference on the full image without any crop.
+def working_to_display(pts, scale_x, scale_y):
+    """Scale (N,2) points from working-image space to display space."""
+    out = np.zeros_like(pts)
+    out[:, 0] = pts[:, 0] * scale_x
+    out[:, 1] = pts[:, 1] * scale_y
+    return out
 
-    Uses KeypointTransform to resize + normalize — same preprocessing as the
-    dataset but without cropping.  Keypoints are returned in [0, 1] relative
-    to the full (resized) image.
+
+def box_to_display(crop_box, scale_x, scale_y):
+    """Scale (x1,y1,x2,y2) crop_box from working-image space to display space."""
+    x1, y1, x2, y2 = crop_box
+    return np.array([x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y],
+                    dtype=np.float32)
+
+
+def quat_to_dcm(q_wxyz):
+    """Convert (w,x,y,z) quaternion to direction cosine matrix."""
+    w, x, y, z = q_wxyz
+    return np.array([
+        [1 - 2*(y**2 + z**2),  2*(x*y - w*z),      2*(x*z + w*y)],
+        [2*(x*y + w*z),        1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+        [2*(x*z - w*y),        2*(y*z + w*x),       1 - 2*(x**2 + y**2)],
+    ])
+
+
+def project_gt_keypoints(q_wxyz, t, points_3d, K):
+    """Project 3D model keypoints to 2D using the GT pose.
+
+    q_wxyz: (w,x,y,z) — q_vbs2tango (camera→body), SPEED+ convention
+    t: (3,) translation in camera frame
+    points_3d: (K,3) 3D model keypoints in body frame
+    K: (3,3) camera intrinsics (original image space)
+
+    Returns: (K,2) pixel coords in the ORIGINAL image coordinate space.
     """
-    img = Image.open(img_path)
-    orig_w, orig_h = img.size
-    if img.mode == "L":
-        img = img.convert("RGB")
-
-    # Reuse the existing transform: resize to image_size and normalize.
-    # Pass dummy keypoints (they're unchanged by the transform).
-    dummy_kp = np.zeros((num_keypoints, 2), dtype=np.float32)
-    dummy_vis = np.zeros(num_keypoints, dtype=np.int64)
-    img_tensor, _, _ = transform(img, dummy_kp, dummy_vis)
-    img_tensor = img_tensor.unsqueeze(0).to(device)
-
-    fwd_kwargs = {"pixel_values": img_tensor}
-    if mode == "keypoint_pnp":
-        # Provide a full-image crop box so the internal PnP uses the original K.
-        fwd_kwargs["crop_box"] = torch.tensor(
-            [[0.0, 0.0, float(orig_w), float(orig_h)]], device=device
-        )
-        fwd_kwargs["img_size"] = torch.tensor(
-            [[float(orig_w), float(orig_h)]], device=device
-        )
-        fwd_kwargs["visibility"] = vis_tensor.unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        out = model(**fwd_kwargs)
-
-    pred_kp = out["keypoints"].cpu().squeeze(0).numpy()  # (K, 2) in [0, 1]
-    conf = None
-    if "heatmaps" in out:
-        hm = out["heatmaps"].cpu().squeeze(0).numpy()  # (K, H, W)
-        conf = hm.max(axis=(1, 2))
-
-    return pred_kp, conf
+    R_body2cam = quat_to_dcm(q_wxyz)  # standard quat→dcm = R_body2cam in SPEED+ convention
+    rvec, _ = cv2.Rodrigues(R_body2cam.astype(np.float64))
+    kp_2d, _ = cv2.projectPoints(
+        points_3d.reshape(-1, 1, 3).astype(np.float64),
+        rvec,
+        t.reshape(3, 1).astype(np.float64),
+        K.astype(np.float64),
+        None,
+    )
+    return kp_2d.reshape(-1, 2)
 
 
-def draw_crop_panel(
-    full_display, pred_kp_crop, gt_kp_crop, visibility, crop_box,
-    confidence_per_kpt, drop_info, scale, radius=6,
+# ---------------------------------------------------------------------------
+# Draw functions — all coords already in display pixels
+# ---------------------------------------------------------------------------
+
+def draw_dropped_image(
+    full_image, pred_px, gt_px, visibility, box_disp,
+    confidence_per_kpt, drop_info, radius=6,
 ):
-    """Draw the LEFT panel: crop inference that failed.
+    """Draw LEFT panel: crop inference that failed.
 
-    Predicted keypoints are color-coded by confidence (red=low, green=high).
-    GT keypoints are shown in cyan. Occluded keypoints are shown as hollow circles.
+    pred_px, gt_px, box_disp: all in display pixel coords.
     """
-    img = full_display.copy()
+    img = full_image.copy()
     draw = ImageDraw.Draw(img)
 
-    x1, y1, x2, y2 = crop_box * scale
-
-    # Draw crop bounding box
+    x1, y1, x2, y2 = box_disp
     draw.rectangle([x1, y1, x2, y2], outline="cyan", width=2)
 
-    # Convert keypoints to full-image pixel coords (scaled)
-    pred_px = crop_to_full_keypoints(pred_kp_crop, crop_box) * scale
-    gt_px = crop_to_full_keypoints(gt_kp_crop, crop_box) * scale
+    n_kpts = len(pred_px)
 
-    n_kpts = len(pred_kp_crop)
-
-    # Draw GT keypoints (cyan, smaller)
+    # GT keypoints (cyan)
     for i in range(n_kpts):
         gx, gy = gt_px[i, 0], gt_px[i, 1]
         r = radius - 2
         if visibility[i] > 0:
-            draw.ellipse([gx - r, gy - r, gx + r, gy + r],
-                         fill="cyan", outline="white")
+            draw.ellipse([gx - r, gy - r, gx + r, gy + r], fill="cyan", outline="white")
         else:
-            draw.ellipse([gx - r, gy - r, gx + r, gy + r],
-                         outline="cyan", width=1)
+            draw.ellipse([gx - r, gy - r, gx + r, gy + r], outline="cyan", width=1)
 
-    # Draw predicted keypoints (color-coded by confidence)
+    # Predicted keypoints (color-coded by confidence)
     for i in range(n_kpts):
         px, py = pred_px[i, 0], pred_px[i, 1]
         conf = confidence_per_kpt[i] if confidence_per_kpt is not None else 0.5
         color = confidence_color(conf)
-
         if visibility[i] > 0:
             draw.ellipse([px - radius, py - radius, px + radius, py + radius],
                          fill=color, outline="white")
@@ -167,30 +176,23 @@ def draw_crop_panel(
         else:
             draw.ellipse([px - radius, py - radius, px + radius, py + radius],
                          outline=color, width=2)
-
         conf_str = f"{conf:.2f}" if confidence_per_kpt is not None else "?"
-        label = f"{i}:{conf_str}"
-        draw.text((px + radius + 2, py - 6), label, fill="white")
+        draw.text((px + radius + 2, py - 6), f"{i}:{conf_str}", fill="white")
 
-    # Info overlay at top
+    # Info overlay
     disp_w = img.width
     overlay_h = 60
-    draw.rectangle([0, 0, disp_w, overlay_h], fill=(80, 0, 0))
-
+    draw.rectangle([0, 0, disp_w, overlay_h], fill=(0, 0, 0, 180))
     filename = drop_info["filename"]
     method = drop_info["method"]
     n_vis = drop_info["n_visible"]
     n_used = drop_info["n_kpts_used"]
     min_conf = drop_info["min_conf"]
+    line1 = f"{filename}  |  reason: {method}  |  visible: {n_vis}/11  |  used: {n_used}  |  min_conf: {min_conf:.4f}"
+    draw.text((4, 4), line1, fill="white")
 
-    draw.text((4, 4), "CROP INFERENCE (FAILED)", fill="red")
-    line2 = f"{filename}  |  reason: {method}  |  visible: {n_vis}/11  |  used: {n_used}  |  min_conf: {min_conf:.4f}"
-    draw.text((4, 20), line2, fill="white")
-
-    # Confidence bar for each keypoint
     if confidence_per_kpt is not None:
-        bar_y = 40
-        bar_h = 10
+        bar_y, bar_h = 24, 12
         bar_total_w = min(disp_w - 20, n_kpts * 50)
         bar_w = bar_total_w / n_kpts
         for i in range(n_kpts):
@@ -198,67 +200,53 @@ def draw_crop_panel(
             color = confidence_color(c)
             bx = 10 + i * bar_w
             fill_h = int(bar_h * min(c / 5.0, 1.0))
-            draw.rectangle([bx, bar_y + bar_h - fill_h, bx + bar_w - 2, bar_y + bar_h],
-                           fill=color)
-            draw.rectangle([bx, bar_y, bx + bar_w - 2, bar_y + bar_h],
-                           outline="gray")
+            draw.rectangle([bx, bar_y + bar_h - fill_h, bx + bar_w - 2, bar_y + bar_h], fill=color)
+            draw.rectangle([bx, bar_y, bx + bar_w - 2, bar_y + bar_h], outline="gray")
+            name = KEYPOINT_NAMES[i] if i < len(KEYPOINT_NAMES) else str(i)
+            draw.text((bx, bar_y + bar_h + 2), name, fill="gray")
 
-    # Legend at bottom
     disp_h = img.height
     draw.rectangle([0, disp_h - 18, disp_w, disp_h], fill=(0, 0, 0))
     draw.text((4, disp_h - 16),
-              "pred: red=low conf, green=high | cyan=GT | yellow=error | hollow=occluded",
+              "pred: red=low conf, green=high conf | cyan=GT | yellow=error | hollow=occluded",
               fill="gray")
-
     return img
 
 
 def draw_fullimg_panel(
-    full_display, pred_kp_full, gt_kp_crop, visibility, crop_box,
-    confidence_per_kpt, scale, radius=6,
+    full_display, pred_px, gt_px, visibility, box_disp,
+    confidence_per_kpt, pnp_pass, pnp_inliers, radius=6,
 ):
-    """Draw the RIGHT panel: full-image inference (no crop).
+    """Draw RIGHT panel: full-image inference.
 
-    Predicted keypoints are in [0, 1] relative to the full (resized) image.
-    The original crop region is shown in orange for reference.
-    GT keypoints are re-derived from crop-relative coords + crop_box.
+    pred_px, gt_px, box_disp: all in display pixel coords.
+    pnp_pass: bool — whether PnP succeeded on full-image keypoints.
+    pnp_inliers: int — number of RANSAC inliers.
     """
     img = full_display.copy()
     draw = ImageDraw.Draw(img)
     disp_w, disp_h = img.size
 
-    # Show original crop region in orange for reference
-    x1, y1, x2, y2 = crop_box * scale
+    # Original crop region in orange for reference
+    x1, y1, x2, y2 = box_disp
     draw.rectangle([x1, y1, x2, y2], outline="orange", width=2)
 
-    # Map predicted keypoints to display space (full image relative)
-    pred_px = np.stack([
-        pred_kp_full[:, 0] * disp_w,
-        pred_kp_full[:, 1] * disp_h,
-    ], axis=1)
+    n_kpts = len(pred_px)
 
-    # GT keypoints in display space (derived from crop_box)
-    gt_px = crop_to_full_keypoints(gt_kp_crop, crop_box) * scale
-
-    n_kpts = len(pred_kp_full)
-
-    # Draw GT keypoints (cyan)
+    # GT keypoints (cyan)
     for i in range(n_kpts):
         gx, gy = gt_px[i, 0], gt_px[i, 1]
         r = radius - 2
         if visibility[i] > 0:
-            draw.ellipse([gx - r, gy - r, gx + r, gy + r],
-                         fill="cyan", outline="white")
+            draw.ellipse([gx - r, gy - r, gx + r, gy + r], fill="cyan", outline="white")
         else:
-            draw.ellipse([gx - r, gy - r, gx + r, gy + r],
-                         outline="cyan", width=1)
+            draw.ellipse([gx - r, gy - r, gx + r, gy + r], outline="cyan", width=1)
 
-    # Draw predicted keypoints (color-coded by confidence)
+    # Predicted keypoints (color-coded by confidence)
     for i in range(n_kpts):
         px, py = pred_px[i, 0], pred_px[i, 1]
         conf = confidence_per_kpt[i] if confidence_per_kpt is not None else 0.5
         color = confidence_color(conf)
-
         if visibility[i] > 0:
             draw.ellipse([px - radius, py - radius, px + radius, py + radius],
                          fill=color, outline="white")
@@ -267,26 +255,30 @@ def draw_fullimg_panel(
         else:
             draw.ellipse([px - radius, py - radius, px + radius, py + radius],
                          outline=color, width=2)
-
         conf_str = f"{conf:.2f}" if confidence_per_kpt is not None else "?"
         draw.text((px + radius + 2, py - 6), f"{i}:{conf_str}", fill="white")
 
-    # Header
-    draw.rectangle([0, 0, disp_w, 22], fill=(0, 80, 0))
-    draw.text((4, 4), "FULL IMAGE INFERENCE", fill="lime")
+    # Header with PnP pass/fail
+    if pnp_pass:
+        header_bg = (0, 100, 0)
+        pnp_str = f"PASS  ({pnp_inliers} inliers)"
+        pnp_color = "lime"
+    else:
+        header_bg = (120, 0, 0)
+        pnp_str = f"FAIL  ({pnp_inliers} inliers)"
+        pnp_color = "red"
+    draw.rectangle([0, 0, disp_w, 22], fill=header_bg)
+    draw.text((4, 4), f"FULL IMAGE  |  PnP: {pnp_str}  |  orange = original crop", fill=pnp_color)
 
-    # Legend at bottom
     draw.rectangle([0, disp_h - 18, disp_w, disp_h], fill=(0, 0, 0))
     draw.text((4, disp_h - 16),
-              "orange = original crop region | cyan = GT | yellow = pred→GT error",
+              "pred: red=low conf, green=high conf | cyan=GT | yellow=error | hollow=occluded",
               fill="gray")
-
     return img
 
 
 def stitch_panels(left, right):
     """Stitch two same-height panels side by side with a thin separator."""
-    assert left.height == right.height
     sep = 4
     combined = Image.new("RGB", (left.width + sep + right.width, left.height), (40, 40, 40))
     combined.paste(left, (0, 0))
@@ -294,16 +286,73 @@ def stitch_panels(left, right):
     return combined
 
 
+def try_pnp(kp_px, visibility, points_3d, camera_matrix, dist_coeffs,
+             reproj_error=8.0, iterations=100, ransac_confidence=0.999):
+    """Run EPnP RANSAC on predicted keypoints. Returns (success, n_inliers)."""
+    vis_mask = visibility > 0
+    if vis_mask.sum() < 4:
+        return False, 0
+    pts_2d = kp_px[vis_mask].reshape(-1, 1, 2).astype(np.float64)
+    pts_3d = points_3d[vis_mask].reshape(-1, 1, 3).astype(np.float64)
+    cv2.setRNGSeed(42)
+    ok, _, _, inliers = cv2.solvePnPRansac(
+        pts_3d, pts_2d, camera_matrix.astype(np.float64),
+        dist_coeffs.astype(np.float64) if dist_coeffs is not None else None,
+        flags=cv2.SOLVEPNP_EPNP,
+        reprojectionError=reproj_error,
+        iterationsCount=iterations,
+        confidence=ransac_confidence,
+    )
+    if ok and inliers is not None and len(inliers) >= 4:
+        return True, len(inliers)
+    return False, 0
+
+
+def infer_fullimage(model, img_path, transform, num_keypoints, device, mode, vis_tensor):
+    """Run model inference on the full image without any crop.
+
+    Returns pred_kp in [0,1] relative to the full squashed image.
+    """
+    img = Image.open(img_path)
+    orig_w, orig_h = img.size
+    if img.mode == "L":
+        img = img.convert("RGB")
+    dummy_kp = np.zeros((num_keypoints, 2), dtype=np.float32)
+    dummy_vis = np.zeros(num_keypoints, dtype=np.int64)
+    img_tensor, _, _ = transform(img, dummy_kp, dummy_vis)
+    img_tensor = img_tensor.unsqueeze(0).to(device)
+
+    fwd_kwargs = {"pixel_values": img_tensor}
+    if mode == "keypoint_pnp":
+        fwd_kwargs["crop_box"] = torch.tensor(
+            [[0.0, 0.0, float(orig_w), float(orig_h)]], device=device)
+        fwd_kwargs["img_size"] = torch.tensor(
+            [[float(orig_w), float(orig_h)]], device=device)
+        fwd_kwargs["visibility"] = vis_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model(**fwd_kwargs)
+
+    pred_kp = out["keypoints"].cpu().squeeze(0).numpy()
+    conf = None
+    if "heatmaps" in out:
+        hm = out["heatmaps"].cpu().squeeze(0).numpy()
+        conf = hm.max(axis=(1, 2))
+    return pred_kp, conf
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize dropped images from evaluate_robust")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--splits", type=str, nargs="+", default=["val", "lightbox", "sunlamp"])
-    parser.add_argument("--out_dir", type=str, default=None, help="Output dir (default: <ckpt_dir>/viz_dropped)")
+    parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--display_width", type=int, default=960)
-    parser.add_argument("--max_images", type=int, default=0, help="Max images to visualize per split (0=all)")
-    parser.add_argument("--no_crop", action="store_true", help="Match evaluate_robust --no_crop flag")
-    parser.add_argument("--gt_crop", action="store_true", help="Match evaluate_robust --gt_crop flag")
-    parser.add_argument("--resize_first", action="store_true", help="Match evaluate_robust --resize_first flag")
+    parser.add_argument("--max_images", type=int, default=0)
+    parser.add_argument("--no_crop", action="store_true")
+    parser.add_argument("--gt_crop", action="store_true")
+    parser.add_argument("--resize_first", action="store_true")
+    parser.add_argument("--reproj_error", type=float, default=8.0,
+                        help="RANSAC reprojection error for the 'would pass' PnP check (default: 8.0)")
     args = parser.parse_args()
 
     ckpt_dir = Path(args.checkpoint).parent
@@ -312,7 +361,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load checkpoint and config
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt["config"]
@@ -323,14 +371,11 @@ def main():
     pose_cfg = config.get("pose", {})
     image_size = config["data"]["image_size"]
     num_keypoints = config["data"]["num_keypoints"]
-    imagenet_normalize = config["data"].get("imagenet_normalize", True)
 
-    # Load 3D model data
     pnp_data = None
     if geo_cfg.get("points_3d") and geo_cfg.get("camera"):
         pnp_data = load_pnp_data(geo_cfg["points_3d"], geo_cfg["camera"])
 
-    # Build model
     model = SatellitePoseModel(
         backbone_name=config["model"]["backbone"],
         freeze_backbone=True,
@@ -355,11 +400,10 @@ def main():
     transform = KeypointTransform(
         image_size=image_size,
         is_train=False,
-        imagenet_normalize=imagenet_normalize,
+        imagenet_normalize=config["data"].get("imagenet_normalize", True),
     )
 
     for split in args.splits:
-        # Check for dropped file
         dropped_path = ckpt_dir / f"dropped_{split}.txt"
         if not dropped_path.exists():
             print(f"  No dropped file for {split} ({dropped_path}), skipping")
@@ -380,7 +424,6 @@ def main():
         print(f"  {split}: {len(dropped)} dropped images to visualize")
         print(f"{'':=<80}")
 
-        # Load dataset (for crop inference side)
         if split not in config["data"]["splits"]:
             print(f"  Split {split} not in config, skipping")
             continue
@@ -419,9 +462,9 @@ def main():
 
             # ---- Crop inference (left panel) ----
             image_tensor = sample["image"].unsqueeze(0).to(device)
-            gt_kp = sample["keypoints"].numpy()
+            gt_kp = sample["keypoints"].numpy()        # crop-relative [0,1]
             vis = sample["visibility"].numpy()
-            crop_box = sample["crop_box"].numpy()
+            crop_box = sample["crop_box"].numpy()      # working-image pixel coords
 
             fwd_kwargs = {"pixel_values": image_tensor}
             if mode == "keypoint_pnp":
@@ -432,31 +475,64 @@ def main():
             with torch.no_grad():
                 model_out = model(**fwd_kwargs)
 
-            pred_kp_crop = model_out["keypoints"].cpu().squeeze(0).numpy()
+            pred_kp = model_out["keypoints"].cpu().squeeze(0).numpy()  # crop-relative [0,1]
 
-            conf_crop = None
+            conf_per_kpt = None
             if "heatmaps" in model_out:
-                hm = model_out["heatmaps"].cpu().squeeze(0).numpy()  # (K, H, W)
-                conf_crop = hm.max(axis=(1, 2))
+                hm = model_out["heatmaps"].cpu().squeeze(0).numpy()
+                conf_per_kpt = hm.max(axis=(1, 2))
+            if conf_per_kpt is None and info["confidence"] is not None:
+                conf_per_kpt = np.array(info["confidence"])
 
-            if conf_crop is None and info["confidence"] is not None:
-                conf_crop = np.array(info["confidence"])
-
-            # Load original full image for display
+            # ---- Load original image for display background ----
             img_path = dataset.samples[idx][0]
             full_image = Image.open(img_path)
             if full_image.mode == "L":
                 full_image = full_image.convert("RGB")
 
             orig_w, orig_h = full_image.size
+            # Scale that maps original image → display (preserves aspect ratio)
             scale = args.display_width / orig_w
             display_h = int(orig_h * scale)
             full_display = full_image.resize((args.display_width, display_h), Image.BILINEAR)
 
-            left_panel = draw_crop_panel(
-                full_display, pred_kp_crop, gt_kp, vis, crop_box,
-                conf_crop, info, scale, radius=6,
-            )
+            # ---- Coordinate transforms ----
+            #
+            # crop_box is in "working image space":
+            #   - resize_first=True  → working = image_size × image_size (e.g. 512×512)
+            #   - resize_first=False → working = orig_w × orig_h
+            #
+            # Display image is always orig_w*scale × orig_h*scale.
+            # Working→display scale factors:
+            if args.resize_first:
+                sw_x = args.display_width / image_size     # e.g. 960/512 = 1.875
+                sw_y = display_h / image_size              # e.g. 600/512 = 1.172
+            else:
+                sw_x = scale    # display_w / orig_w
+                sw_y = scale    # display_h / orig_h  (same since aspect ratio preserved)
+
+            # Crop box in display coords
+            box_disp = box_to_display(crop_box, sw_x, sw_y)
+
+            # Left panel predicted keypoints:
+            # crop-relative [0,1] → working-image px → display px
+            pred_kp_working = crop_to_working(pred_kp, crop_box)
+            pred_px_crop = working_to_display(pred_kp_working, sw_x, sw_y)
+
+            # GT keypoints: project 3D model points with GT pose → original image px → display px
+            # This gives the true satellite keypoint positions regardless of crop box placement.
+            if sample["has_pose"].item() and pnp_data is not None:
+                q = sample["quaternion"].numpy()
+                t = sample["translation"].numpy()
+                kp_2d_orig = project_gt_keypoints(
+                    q, t, pnp_data["points_3d"], pnp_data["camera_matrix"]
+                )
+                # project_gt_keypoints output is in original image pixel space
+                gt_px_disp = kp_2d_orig * scale
+            else:
+                # Fallback: crop-relative → working → display
+                gt_kp_working = crop_to_working(gt_kp, crop_box)
+                gt_px_disp = working_to_display(gt_kp_working, sw_x, sw_y)
 
             # ---- Full-image inference (right panel) ----
             pred_kp_full, conf_full = infer_fullimage(
@@ -464,23 +540,50 @@ def main():
                 mode, sample["visibility"],
             )
 
+            # Full-image pred: [0,1] relative to 512×512 squashed image.
+            # Mapping to display: [0,1] → orig pixel (via *orig_w, *orig_h) → display (via *scale)
+            # = pred * [display_w, display_h]
+            pred_px_full = np.stack([
+                pred_kp_full[:, 0] * args.display_width,
+                pred_kp_full[:, 1] * display_h,
+            ], axis=1)
+
+            # ---- Would full-image inference pass PnP? ----
+            pnp_pass, pnp_inliers = False, 0
+            if pnp_data is not None:
+                # Map full-image [0,1] keypoints to original pixel space for PnP
+                kp_px_full_orig = np.stack([
+                    pred_kp_full[:, 0] * orig_w,
+                    pred_kp_full[:, 1] * orig_h,
+                ], axis=1)
+                pnp_pass, pnp_inliers = try_pnp(
+                    kp_px_full_orig, vis,
+                    pnp_data["points_3d"], pnp_data["camera_matrix"],
+                    pnp_data["dist_coeffs"],
+                    reproj_error=args.reproj_error,
+                )
+
+            # ---- Draw panels ----
+            left_panel = draw_dropped_image(
+                full_display, pred_px_crop, gt_px_disp, vis, box_disp,
+                conf_per_kpt, info, radius=6,
+            )
             right_panel = draw_fullimg_panel(
-                full_display, pred_kp_full, gt_kp, vis, crop_box,
-                conf_full, scale, radius=6,
+                full_display, pred_px_full, gt_px_disp, vis, box_disp,
+                conf_full, pnp_pass, pnp_inliers, radius=6,
             )
 
-            # ---- Stitch and save ----
             combined = stitch_panels(left_panel, right_panel)
             stem = Path(filename).stem
             combined.save(split_dir / f"{stem}.png")
 
-            # Save heatmap overlay for the crop inference side (if available)
+            # Heatmap overlay for crop inference side
             if "heatmaps" in model_out:
-                sx1, sy1, sx2, sy2 = (crop_box * scale).astype(int)
-                sx1, sy1 = max(0, sx1), max(0, sy1)
-                sx2 = min(args.display_width, sx2)
-                sy2 = min(display_h, sy2)
-                crop_region = full_display.crop((sx1, sy1, sx2, sy2))
+                bx1, by1, bx2, by2 = box_disp.astype(int)
+                bx1, by1 = max(0, bx1), max(0, by1)
+                bx2 = min(args.display_width, bx2)
+                by2 = min(display_h, by2)
+                crop_region = full_display.crop((bx1, by1, bx2, by2))
                 hm_viz = visualize_heatmaps(
                     crop_region,
                     model_out["heatmaps"].cpu().squeeze(0).numpy(),
@@ -494,19 +597,16 @@ def main():
             print(f"  No images visualized for {split}")
             continue
 
-        # Build summary grid (1 column, each tile is the full side-by-side comparison)
-        tile_w = args.display_width * 2 + 4  # left + sep + right
-        n_rows = len(tiles)
+        tile_w = args.display_width * 2 + 4
         header_h = 28
-        grid_w = tile_w
-        grid_h = n_rows * tile_h + header_h
-
-        grid = Image.new("RGB", (grid_w, grid_h), color=(30, 30, 30))
+        grid = Image.new("RGB", (tile_w, len(tiles) * tile_h + header_h), color=(30, 30, 30))
         draw = ImageDraw.Draw(grid)
-        draw.text((8, 6),
-                  f"DROPPED — {split.upper()} — {len(tiles)} images — epoch {epoch}  |  LEFT: crop failed  |  RIGHT: full-image fallback",
-                  fill="red")
-
+        draw.text(
+            (8, 6),
+            f"DROPPED — {split.upper()} — {len(tiles)} images — epoch {epoch}"
+            "  |  LEFT: crop inference (failed)  |  RIGHT: full-image inference",
+            fill="red",
+        )
         for i, tile in enumerate(tiles):
             grid.paste(tile, (0, i * tile_h + header_h))
 

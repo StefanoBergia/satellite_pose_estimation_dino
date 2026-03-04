@@ -1,0 +1,33 @@
+# Self-Training with Pseudo-Labels — INCREMENTAL CUMULATIVE
+# Each step trains on a growing window: chunk0 → chunks0+1 → … → chunks0+1+2+3
+# Pseudo fraction grows naturally: ~9% → ~16% → ~22% → ~28%
+
+self_training:
+  pretrained_checkpoint: "outputs_hrnet_w32/converted_model.pth"
+  confidence_threshold: 0.02
+  pseudo_label_weight: 0.5
+  target_domains:
+    - sunlamp
+    - lightbox
+  synth_subset_size: 16000
+  num_iterations: 5     # overridden by incremental.n_chunks - 1 (holdout)
+  epochs_per_iteration: 10
+
+  incremental:
+    enabled: true
+    mode: "cumulative"
+    n_chunks: 5
+    chunks_dir: "data/splits_incremental"
+    holdout_chunk: 4
+
+train:
+  epochs: 10
+  batch_size: 8
+  lr: 1.0e-4
+  lr_backbone: 1.0e-6
+  weight_decay: 1.0e-4
+  num_workers: 2
+  output_dir: ./outputs_self_training_incremental_cumulative
+
+splits_dir: "data/splits_testfull"
+base_config: "config_keypoint.yaml"

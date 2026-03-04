@@ -101,31 +101,6 @@ def generate_pseudo_labels(model, dataset, device, batch_size=32, num_workers=2)
     )
 
     pseudo_labels = {}
-
-    for batch in tqdm(loader, desc="Generating pseudo-labels"):
-        images = batch["image"].to(device)
-        model_out = model(pixel_values=images)
-
-        kp = model_out["keypoints"].cpu().numpy()  # (B, K, 2)
-
-        # Extract confidence from heatmaps
-        if "heatmaps" in model_out:
-            hm = model_out["heatmaps"].cpu().numpy()  # (B, K, H, W)
-            confidence = hm.max(axis=(2, 3))  # (B, K) peak heatmap value
-        else:
-            # For MLP head, use distance from center as proxy
-            confidence = np.ones((kp.shape[0], kp.shape[1]))
-
-        # Map back to filenames via dataset
-        # The dataset stores (img_path, label_path) tuples
-        batch_size_actual = images.shape[0]
-        for i in range(batch_size_actual):
-            # Get the dataset index for this batch item
-            # Since we iterate sequentially, track the global index
-            pass
-
-    # Re-iterate with index tracking
-    pseudo_labels = {}
     idx = 0
     for batch in tqdm(loader, desc="Generating pseudo-labels"):
         images = batch["image"].to(device)
@@ -193,7 +168,7 @@ def evaluate_on_test(model, config, domain, test_list, device, pnp_data,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    kp_metrics, pnp_results, pose_errors, method_counts = evaluate_split(
+    kp_metrics, pnp_results, pose_errors, method_counts, _, _ = evaluate_split(
         model, loader, mode, device, pnp_data,
         min_landmarks=min_landmarks,
         reproj_error=reproj_error,
@@ -304,6 +279,18 @@ def main():
     num_iterations = st_cfg.get("num_iterations", 3)
     epochs_per_iter = st_cfg.get("epochs_per_iteration", 10)
     target_domains = st_cfg.get("target_domains", ["sunlamp", "lightbox"])
+    synth_subset_size = st_cfg.get("synth_subset_size", None)
+
+    # Incremental self-training config
+    inc_cfg = st_cfg.get("incremental", {})
+    incremental_mode = inc_cfg.get("enabled", False)
+    inc_variant = inc_cfg.get("mode", "sequential")   # "sequential" or "cumulative"
+    n_chunks = inc_cfg.get("n_chunks", 5)
+    chunks_dir = inc_cfg.get("chunks_dir", "data/splits_incremental")
+    holdout_chunk = inc_cfg.get("holdout_chunk", None)  # index to hold out from adaptation
+    if incremental_mode:
+        train_chunks = [i for i in range(n_chunks) if i != holdout_chunk]
+        num_iterations = len(train_chunks)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mode = config["model"]["mode"]
@@ -325,10 +312,21 @@ def main():
     # Load style/test splits
     style_lists = {}
     test_lists = {}
+    chunk_lists = {}
     for domain in target_domains:
-        style_lists[domain] = load_split_list(splits_dir, domain, "style")
         test_lists[domain] = load_split_list(splits_dir, domain, "test")
-        print(f"  {domain}: {len(style_lists[domain])} style, {len(test_lists[domain])} test")
+        if incremental_mode:
+            chunk_lists[domain] = [
+                load_split_list(chunks_dir, domain, f"chunk{i}")
+                for i in range(n_chunks)
+            ]
+            holdout_info = f", chunk {holdout_chunk} held out" if holdout_chunk is not None else ""
+            print(f"  {domain}: {len(train_chunks)}/{n_chunks} chunks for adaptation "
+                  f"(~{len(chunk_lists[domain][0])} each{holdout_info}), "
+                  f"{len(test_lists[domain])} test  [{inc_variant}]")
+        else:
+            style_lists[domain] = load_split_list(splits_dir, domain, "style")
+            print(f"  {domain}: {len(style_lists[domain])} style, {len(test_lists[domain])} test")
 
     # Build model and load checkpoint
     print(f"\nLoading checkpoint: {checkpoint_path}")
@@ -368,6 +366,19 @@ def main():
         for domain in target_domains:
             print(f"\n  Generating pseudo-labels for {domain} style split...")
 
+            # Determine which images to use for this iteration
+            if incremental_mode:
+                if inc_variant == "cumulative":
+                    chunks_to_use = train_chunks[:iteration]
+                else:
+                    chunks_to_use = [train_chunks[iteration - 1]]
+                current_style: set = set()
+                for ci in chunks_to_use:
+                    current_style.update(chunk_lists[domain][ci])
+                print(f"    [{inc_variant} chunks {chunks_to_use}] {len(current_style)} images")
+            else:
+                current_style = style_lists[domain]
+
             # Build dataset for inference (style split only, no augmentation)
             split_cfg = config["data"]["splits"][domain]
             style_dataset = SpeedPlusKeypointDataset(
@@ -376,7 +387,7 @@ def main():
                 num_keypoints=config["data"]["num_keypoints"],
                 bbox_pad_ratio=config["data"].get("bbox_pad_ratio", 0.1),
                 transform=eval_transform,
-                include_list=style_lists[domain],
+                include_list=current_style,
                 no_crop=args.no_crop,
                 gt_crop=args.gt_crop,
                 resize_first=config["data"]["image_size"] if args.resize_first else 0,
@@ -411,9 +422,14 @@ def main():
         # Step 2: Build mixed training set
         if all_pseudo_datasets:
             pseudo_combined = ConcatDataset(all_pseudo_datasets)
-            wrapped_train = AddPseudoKeys(train_dataset, config["data"]["num_keypoints"])
+            # Optionally downsample synthetic set — resample each iteration for coverage
+            synth_ds = train_dataset
+            if synth_subset_size and synth_subset_size < len(train_dataset):
+                indices = torch.randperm(len(train_dataset))[:synth_subset_size].tolist()
+                synth_ds = torch.utils.data.Subset(train_dataset, indices)
+            wrapped_train = AddPseudoKeys(synth_ds, config["data"]["num_keypoints"])
             mixed_dataset = ConcatDataset([wrapped_train, pseudo_combined])
-            print(f"\n  Mixed dataset: {len(train_dataset)} synthetic + "
+            print(f"\n  Mixed dataset: {len(synth_ds)} synthetic + "
                   f"{len(pseudo_combined)} pseudo = {len(mixed_dataset)} total")
         else:
             mixed_dataset = train_dataset
@@ -457,6 +473,8 @@ def main():
             num_workers=config["train"]["num_workers"], pin_memory=True,
         )
 
+        config["train"]["save_best_model"] = False
+        config.setdefault("pose", {})["lambda_msssim"] = 0.0  # no MS-SSIM in self-training
         trainer = Trainer(
             model=model,
             train_loader=train_loader,

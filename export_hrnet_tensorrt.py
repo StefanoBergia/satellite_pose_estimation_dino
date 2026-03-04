@@ -288,11 +288,10 @@ def build_trt_engine(onnx_path, trt_path, image_size, fp16, int8, dynamic_batch,
     parser = trt.OnnxParser(network, TRT_LOGGER)
 
     print(f"Parsing ONNX model: {onnx_path}")
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                print(f"  ONNX parse error: {parser.get_error(i)}")
-            return False
+    if not parser.parse_from_file(os.path.abspath(onnx_path)):
+        for i in range(parser.num_errors):
+            print(f"  ONNX parse error: {parser.get_error(i)}")
+        return False
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4 GB

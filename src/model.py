@@ -21,6 +21,13 @@ from .hrnet_w32_backbone import (
     HRNET_W32_OUT_CHANNELS,
 )
 from .hrnet_w32_head import HRNetW32KeypointHead
+from .hrnet_w64_backbone import (
+    build_hrnet_w64,
+    freeze_hrnet_w64,
+    unfreeze_hrnet_w64,
+    hrnet_w64_forward,
+    HRNET_W64_OUT_CHANNELS,
+)
 
 
 class KeypointHead(nn.Module):
@@ -364,6 +371,13 @@ class SatellitePoseModel(nn.Module):
 
             if freeze_backbone:
                 freeze_hrnet_w32(self.backbone, unfreeze_last_n_stages=unfreeze_last_n_blocks)
+        elif backbone_type == "hrnet_w64":
+            # HRNet-W64 backbone via timm — same 128ch stage1 output as W32
+            self.backbone = build_hrnet_w64(hrnet_pretrained)
+            hidden_size = HRNET_W64_OUT_CHANNELS  # 128
+
+            if freeze_backbone:
+                freeze_hrnet_w64(self.backbone, unfreeze_last_n_stages=unfreeze_last_n_blocks)
         elif backbone_type == "hrnet":
             # HRNet-W48 backbone via timm
             self.backbone = build_hrnet_w48(hrnet_pretrained)
@@ -381,7 +395,7 @@ class SatellitePoseModel(nn.Module):
 
         # Keypoint head (always present)
         if keypoint_head_type == "heatmap":
-            if backbone_type == "hrnet_w32":
+            if backbone_type in ("hrnet_w32", "hrnet_w64"):
                 self.keypoint_head = HRNetW32KeypointHead(
                     in_channels=hidden_size,
                     num_keypoints=num_keypoints,
@@ -447,6 +461,9 @@ class SatellitePoseModel(nn.Module):
         if self.backbone_type == "hrnet_w32":
             freeze_hrnet_w32(self.backbone, unfreeze_last_n_stages=unfreeze_last_n)
             return
+        if self.backbone_type == "hrnet_w64":
+            freeze_hrnet_w64(self.backbone, unfreeze_last_n_stages=unfreeze_last_n)
+            return
         if self.backbone_type == "hrnet":
             freeze_hrnet(self.backbone, unfreeze_last_n_stages=unfreeze_last_n)
             return
@@ -469,6 +486,8 @@ class SatellitePoseModel(nn.Module):
     def unfreeze_backbone(self):
         if self.backbone_type == "hrnet_w32":
             unfreeze_hrnet_w32(self.backbone)
+        elif self.backbone_type == "hrnet_w64":
+            unfreeze_hrnet_w64(self.backbone)
         elif self.backbone_type == "hrnet":
             unfreeze_hrnet(self.backbone)
         else:
@@ -494,9 +513,12 @@ class SatellitePoseModel(nn.Module):
         """
         result = {}
 
-        if self.backbone_type == "hrnet_w32":
-            # HRNet-W32 path: returns (B, 128, H/4, W/4) spatial feature map
-            feat_map = hrnet_w32_forward(self.backbone, pixel_values)
+        if self.backbone_type in ("hrnet_w32", "hrnet_w64"):
+            # HRNet-W32/W64 path: returns (B, 128, H/4, W/4) spatial feature map
+            if self.backbone_type == "hrnet_w32":
+                feat_map = hrnet_w32_forward(self.backbone, pixel_values)
+            else:
+                feat_map = hrnet_w64_forward(self.backbone, pixel_values)
 
             if self.keypoint_head_type == "heatmap":
                 kp_out = self.keypoint_head(feat_map)
